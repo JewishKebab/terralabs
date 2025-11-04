@@ -3,23 +3,35 @@ import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
+} from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
-import { Loader2 } from "lucide-react";
+import { Eye, EyeOff, Loader2 } from "lucide-react";
 import logo from "@/assets/terralabs-logo.png";
 import axios from "axios";
 
 const api = axios.create({
   baseURL: "http://localhost:5000",
   headers: { "Content-Type": "application/json" },
-  // withCredentials: true, // enable only if you use cookies on the backend
   timeout: 15000,
 });
 
 const AuthPage = () => {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [showSignupPassword, setShowSignupPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
   const { toast } = useToast();
@@ -50,12 +62,9 @@ const AuthPage = () => {
         if (!token) throw new Error("No token returned from server.");
         localStorage.setItem("auth_token", token);
 
-          // prefer client-side route change
-          navigate("/dashboard", { replace: true });
-
-          // hard fallback if your Router base or navigate fails
-          if (data.redirect_url) {
-            window.location.assign(data.redirect_url); // "/dashboard"
+        navigate("/dashboard", { replace: true });
+        if (data.redirect_url) {
+          window.location.assign(data.redirect_url);
         }
         toast({ title: "Signed in", description: "Welcome back!" });
       } catch (err) {
@@ -82,7 +91,7 @@ const AuthPage = () => {
         if (!token) throw new Error("No token returned from server.");
         localStorage.setItem("auth_token", token);
         toast({ title: "Account created", description: "You’re all set!" });
-        navigate("/");
+        navigate("/dashboard");
       } catch (err) {
         toast({
           variant: "destructive",
@@ -97,21 +106,24 @@ const AuthPage = () => {
   );
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-subtle p-4">
+    <div className="min-h-screen flex items-start justify-center bg-gradient-subtle p-20">
       <div className="w-full max-w-md">
-        <div className="flex items-center justify-center mb-8">
-          <div className="bg-[#1a1a1a] px-8 py-4 rounded-lg">
-            <img src={logo} alt="TerraLabs" className="h-10" />
+        <div className="flex items-center justify-center mb-6">
+          <div className="px-8 py-2 rounded-lg">
+            <img src={logo} alt="TerraLabs" className="h-25" />
           </div>
         </div>
 
         <Card className="shadow-elegant">
           <CardHeader>
-            <CardTitle>Welcome</CardTitle>
-            <CardDescription>
+            <CardTitle className="flex items-center justify-center">
+              Welcome!
+            </CardTitle>
+            <CardDescription className="flex items-center justify-center">
               Sign in to manage your cloud resources
             </CardDescription>
           </CardHeader>
+
           <CardContent>
             <Tabs defaultValue="login">
               <TabsList className="grid w-full grid-cols-2">
@@ -119,6 +131,7 @@ const AuthPage = () => {
                 <TabsTrigger value="signup">Sign Up</TabsTrigger>
               </TabsList>
 
+              {/* LOGIN TAB */}
               <TabsContent value="login">
                 <form onSubmit={handleLogin} className="space-y-4">
                   <div className="space-y-2">
@@ -132,16 +145,35 @@ const AuthPage = () => {
                       required
                     />
                   </div>
+
                   <div className="space-y-2">
                     <Label htmlFor="login-password">Password</Label>
-                    <Input
-                      id="login-password"
-                      type="password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      required
-                    />
+                    <div className="relative">
+                      <Input
+                        id="login-password"
+                        type={showLoginPassword ? "text" : "password"}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        required
+                        className="pr-10"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setShowLoginPassword((prev) => !prev)
+                        }
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
+                        tabIndex={-1}
+                      >
+                        {showLoginPassword ? (
+                          <EyeOff className="h-5 w-5" />
+                        ) : (
+                          <Eye className="h-5 w-5" />
+                        )}
+                      </button>
+                    </div>
                   </div>
+
                   <Button type="submit" className="w-full" disabled={loading}>
                     {loading ? (
                       <>
@@ -155,6 +187,7 @@ const AuthPage = () => {
                 </form>
               </TabsContent>
 
+              {/* SIGNUP TAB */}
               <TabsContent value="signup">
                 <form onSubmit={handleSignup} className="space-y-4">
                   <div className="space-y-2">
@@ -168,17 +201,36 @@ const AuthPage = () => {
                       required
                     />
                   </div>
+
                   <div className="space-y-2">
                     <Label htmlFor="signup-password">Password</Label>
-                    <Input
-                      id="signup-password"
-                      type="password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      required
-                      minLength={6}
-                    />
+                    <div className="relative">
+                      <Input
+                        id="signup-password"
+                        type={showSignupPassword ? "text" : "password"}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        required
+                        minLength={6}
+                        className="pr-10"
+                      />
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setShowSignupPassword((prev) => !prev)
+                        }
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
+                        tabIndex={-1}
+                      >
+                        {showSignupPassword ? (
+                          <EyeOff className="h-5 w-5" />
+                        ) : (
+                          <Eye className="h-5 w-5" />
+                        )}
+                      </button>
+                    </div>
                   </div>
+
                   <Button type="submit" className="w-full" disabled={loading}>
                     {loading ? (
                       <>

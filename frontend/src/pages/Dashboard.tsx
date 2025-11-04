@@ -85,11 +85,11 @@ const Dashboard = () => {
 
         <div className="flex-1 flex flex-col">
           {/* Header */}
-          <header className="h-16 border-b bg-card flex items-center justify-between px-6 shadow-sm">
+          <header className="h-13 border-b bg-card flex items-center justify-between px-6 shadow-sm">
             <div className="flex items-center gap-4">
               <SidebarTrigger />
-              <div className="bg-[#1a1a1a] px-4 py-2 rounded-md">
-                <img src={logo} alt="TerraLabs" className="h-6" />
+              <div className="py-2 rounded-md">
+                <img src={logo} alt="TerraLabs" className="h-12" />
               </div>
             </div>
             <Button variant="outline" size="sm" onClick={handleLogout}>
