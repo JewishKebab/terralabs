@@ -3,11 +3,20 @@ from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 import jwt, datetime, os
+from flask_cors import CORS
+
 
 # Load environment variables from .env
 load_dotenv()
 
 app = Flask(__name__)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080"]}},
+    supports_credentials=False,  # set True only if you actually use cookies
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
 
 # Secret key for JWT
 app.config['SECRET_KEY'] = os.environ.get('JWT_SECRET', 'fallback-secret')
@@ -28,7 +37,7 @@ class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    password = db.Column(db.String(128), nullable=False)
+    password = db.Column(db.String(255), nullable=False)  # was 128
 
 # Signup route
 @app.route('/api/signup', methods=['POST'])

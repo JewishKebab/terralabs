@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,6 +8,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/hooks/use-toast";
 import { Loader2 } from "lucide-react";
 import logo from "@/assets/terralabs-logo.png";
+import axios from "axios";
+
+const api = axios.create({
+  baseURL: "http://localhost:5000",
+  headers: { "Content-Type": "application/json" },
+  // withCredentials: true, // enable only if you use cookies on the backend
+  timeout: 15000,
+});
 
 const AuthPage = () => {
   const [email, setEmail] = useState("");
@@ -16,71 +24,70 @@ const AuthPage = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
 
-  useEffect(() => {
-    const checkSession = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session) {כירות 
-        navigate("/dashboard");
-      }
-    };
-    checkSession();
+  const postJson = useCallback(async (path: string, body: unknown) => {
+    const res = await api.post(path, body);
+    return res.data;
+  }, []);
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (session) {
-        navigate("/dashboard");
-      }
-    });
-
-    return () => subscription.unsubscribe();
-  }, [navigate]);
-
-  const handleLogin = async (e: React.FormEvent) => {*
-    e.preventDefault();
-    setLoading(true);
-
-    const { error } = await supabase.auth.signInWithPassword({
-      email,
-      password,
-    });
-
-    if (error) {
-      toast({
-        title: "Login Failed",
-        description: error.message,
-        variant: "destructive",
-      });
-    }
-
-    setLoading(false);
+  const extractErr = (err: unknown) => {
+    const e = err as any;
+    return (
+      e?.response?.data?.error ||
+      e?.response?.data?.message ||
+      e?.message ||
+      "Request failed"
+    );
   };
 
-  const handleSignup = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
+  const handleLogin = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (loading) return;
+      setLoading(true);
+      try {
+        const data = await postJson("/api/login", { email, password });
+        const token = data?.token;
+        if (!token) throw new Error("No token returned from server.");
+        localStorage.setItem("auth_token", token);
+        toast({ title: "Signed in", description: "Welcome back!" });
+        navigate("/");
+      } catch (err) {
+        toast({
+          variant: "destructive",
+          title: "Login failed",
+          description: extractErr(err),
+        });
+      } finally {
+        setLoading(false);
+      }
+    },
+    [email, password, loading, navigate, postJson, toast]
+  );
 
-    const { error } = await supabase.auth.signUp({
-      email,
-      password,
-      options: {
-        emailRedirectTo: `${window.location.origin}/dashboard`,
-      },
-    });
-
-    if (error) {
-      toast({
-        title: "Signup Failed",
-        description: error.message,
-        variant: "destructive",
-      });
-    } else {
-      toast({
-        title: "Success",
-        description: "Account created! You can now log in.",
-      });
-    }
-
-    setLoading(false);
-  };
+  const handleSignup = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (loading) return;
+      setLoading(true);
+      try {
+        const data = await postJson("/api/signup", { email, password });
+        const token = data?.token;
+        if (!token) throw new Error("No token returned from server.");
+        localStorage.setItem("auth_token", token);
+        toast({ title: "Account created", description: "You’re all set!" });
+        navigate("/");
+      } catch (err) {
+        toast({
+          variant: "destructive",
+          title: "Signup failed",
+          description: extractErr(err),
+        });
+      } finally {
+        setLoading(false);
+      }
+    },
+    [email, password, loading, navigate, postJson, toast]
+  );
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-subtle p-4">
@@ -104,7 +111,7 @@ const AuthPage = () => {
                 <TabsTrigger value="login">Login</TabsTrigger>
                 <TabsTrigger value="signup">Sign Up</TabsTrigger>
               </TabsList>
-              
+
               <TabsContent value="login">
                 <form onSubmit={handleLogin} className="space-y-4">
                   <div className="space-y-2">
