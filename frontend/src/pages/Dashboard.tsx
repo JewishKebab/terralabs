@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/dashboard/AppSidebar";
@@ -7,38 +7,68 @@ import { Button } from "@/components/ui/button";
 import { LogOut } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import logo from "@/assets/terralabs-logo.png";
+import axios, { AxiosInstance } from "axios";
+
+const API_BASE_URL = "http://localhost:5000"; // your Flask API
 
 const Dashboard = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    const checkAuth = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) {
-        navigate("/auth");
-      } else {
-        setLoading(false);
-      }
-    };
-    checkAuth();
-
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (!session) {
-        navigate("/auth");
-      }
+  // Single axios instance with auth header + 401 handling
+  const api: AxiosInstance = useMemo(() => {
+    const instance = axios.create({
+      baseURL: API_BASE_URL,
+      headers: { "Content-Type": "application/json" },
+      timeout: 15000,
+      // withCredentials: true, // enable only if you switch to cookie auth
     });
 
-    return () => subscription.unsubscribe();
+    instance.interceptors.request.use((config) => {
+      const token = localStorage.getItem("auth_token");
+      if (token) {
+        config.headers = config.headers ?? {};
+        (config.headers as Record<string, string>)["Authorization"] = `Bearer ${token}`;
+      }
+      return config;
+    });
+
+    instance.interceptors.response.use(
+      (res) => res,
+      (err) => {
+        const status = err?.response?.status;
+        if (status === 401) {
+          // token invalid/expired → force logout
+          localStorage.removeItem("auth_token");
+          navigate("/auth");
+        }
+        return Promise.reject(err);
+      }
+    );
+
+    return instance;
   }, [navigate]);
 
+  // Auth check: require token in localStorage (optionally ping a protected endpoint if you add one)
+  useEffect(() => {
+    const token = localStorage.getItem("auth_token");
+    if (!token) {
+      navigate("/auth");
+      return;
+    }
+    // If you later add a protected endpoint, uncomment to verify server-side:
+    // api.get("/api/me").then(() => setLoading(false)).catch(() => navigate("/auth"));
+    setLoading(false);
+  }, [navigate, api]);
+
   const handleLogout = async () => {
-    await supabase.auth.signOut();
+    localStorage.removeItem("auth_token");
     toast({
       title: "Logged Out",
       description: "You have been successfully logged out.",
     });
+    navigate("/auth");
   };
 
   if (loading) {
@@ -58,7 +88,7 @@ const Dashboard = () => {
     <SidebarProvider>
       <div className="min-h-screen flex w-full bg-background">
         <AppSidebar />
-        
+
         <div className="flex-1 flex flex-col">
           {/* Header */}
           <header className="h-16 border-b bg-card flex items-center justify-between px-6 shadow-sm">
@@ -83,7 +113,7 @@ const Dashboard = () => {
                   Follow the steps below to provision your infrastructure using Terraform
                 </p>
               </div>
-              
+
               <ProvisioningStepper />
             </div>
           </main>
