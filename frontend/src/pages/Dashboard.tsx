@@ -7,29 +7,30 @@ import { Button } from "@/components/ui/button";
 import { LogOut } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import logo from "@/assets/terralabs-logo.png";
-import axios, { AxiosInstance } from "axios";
+import axios, { AxiosInstance, AxiosHeaders } from "axios";
 
-const API_BASE_URL = "http://localhost:5000"; // your Flask API
+const API_BASE_URL = "http://localhost:5000";
 
 const Dashboard = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
   const [loading, setLoading] = useState(true);
 
-  // Single axios instance with auth header + 401 handling
+  // axios instance with correct header typing
   const api: AxiosInstance = useMemo(() => {
     const instance = axios.create({
       baseURL: API_BASE_URL,
-      headers: { "Content-Type": "application/json" },
+      headers: new AxiosHeaders({ "Content-Type": "application/json" }),
       timeout: 15000,
-      // withCredentials: true, // enable only if you switch to cookie auth
+      // withCredentials: true, // only if you switch to cookie auth
     });
 
     instance.interceptors.request.use((config) => {
       const token = localStorage.getItem("auth_token");
       if (token) {
-        config.headers = config.headers ?? {};
-        (config.headers as Record<string, string>)["Authorization"] = `Bearer ${token}`;
+        // ensure headers is AxiosHeaders, then set safely
+        config.headers = AxiosHeaders.from(config.headers);
+        (config.headers as AxiosHeaders).set("Authorization", `Bearer ${token}`);
       }
       return config;
     });
@@ -37,9 +38,7 @@ const Dashboard = () => {
     instance.interceptors.response.use(
       (res) => res,
       (err) => {
-        const status = err?.response?.status;
-        if (status === 401) {
-          // token invalid/expired → force logout
+        if (err?.response?.status === 401) {
           localStorage.removeItem("auth_token");
           navigate("/auth");
         }
@@ -50,24 +49,19 @@ const Dashboard = () => {
     return instance;
   }, [navigate]);
 
-  // Auth check: require token in localStorage (optionally ping a protected endpoint if you add one)
+  // auth gate: require token; optionally you can ping a protected endpoint
   useEffect(() => {
     const token = localStorage.getItem("auth_token");
     if (!token) {
       navigate("/auth");
       return;
     }
-    // If you later add a protected endpoint, uncomment to verify server-side:
-    // api.get("/api/me").then(() => setLoading(false)).catch(() => navigate("/auth"));
     setLoading(false);
-  }, [navigate, api]);
+  }, [navigate]);
 
   const handleLogout = async () => {
     localStorage.removeItem("auth_token");
-    toast({
-      title: "Logged Out",
-      description: "You have been successfully logged out.",
-    });
+    toast({ title: "Logged Out", description: "You have been successfully logged out." });
     navigate("/auth");
   };
 

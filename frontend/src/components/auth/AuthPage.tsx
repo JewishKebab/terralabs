@@ -49,8 +49,15 @@ const AuthPage = () => {
         const token = data?.token;
         if (!token) throw new Error("No token returned from server.");
         localStorage.setItem("auth_token", token);
+
+          // prefer client-side route change
+          navigate("/dashboard", { replace: true });
+
+          // hard fallback if your Router base or navigate fails
+          if (data.redirect_url) {
+            window.location.assign(data.redirect_url); // "/dashboard"
+        }
         toast({ title: "Signed in", description: "Welcome back!" });
-        navigate("/");
       } catch (err) {
         toast({
           variant: "destructive",
