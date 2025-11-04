@@ -19,7 +19,7 @@ const AuthPage = () => {
   useEffect(() => {
     const checkSession = async () => {
       const { data: { session } } = await supabase.auth.getSession();
-      if (session) {
+      if (session) {כירות 
         navigate("/dashboard");
       }
     };
@@ -34,7 +34,7 @@ const AuthPage = () => {
     return () => subscription.unsubscribe();
   }, [navigate]);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleLogin = async (e: React.FormEvent) => {*
     e.preventDefault();
     setLoading(true);
 
