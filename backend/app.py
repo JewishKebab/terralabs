@@ -7,11 +7,14 @@ from functools import wraps
 from datetime import datetime, timedelta
 import jwt, os
 
+# 👇 make sure the file is named gitlab_utils.py (no dash)
+from gitlab_utils import MODULE_SCHEMAS, create_lab_in_gitlab
+
 # Azure Blob
 from azure.storage.blob import (
     BlobServiceClient,
     BlobSasPermissions,
-    generate_blob_sas
+    generate_blob_sas,
 )
 
 # ---------- Load env ----------
@@ -24,13 +27,13 @@ CORS(
     resources={r"/api/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080"]}},
     supports_credentials=False,
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"]
+    methods=["GET", "POST", "OPTIONS"],
 )
 
 # ---------- Config ----------
 app.config["SECRET_KEY"] = os.environ.get("JWT_SECRET", "fallback-secret")
 
-# Postgres (Azure) — make sure these are set
+# Postgres (Azure)
 host = os.environ.get("AZURE_SQL_HOST")
 user = os.environ.get("AZURE_SQL_USER")
 password = os.environ.get("AZURE_SQL_PASSWORD")
@@ -42,10 +45,10 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
 AZURE_BLOB_KEY = os.environ.get("AZURE_BLOB_KEY")
 AZURE_CONTAINER_NAME = os.environ.get("AZURE_CONTAINER_NAME")
-
 if not (AZURE_STORAGE_ACCOUNT_NAME and AZURE_BLOB_KEY and AZURE_CONTAINER_NAME):
-    raise RuntimeError("Missing Azure Storage env vars: AZURE_STORAGE_ACCOUNT_NAME, AZURE_BLOB_KEY, AZURE_CONTAINER_NAME")
-
+    raise RuntimeError(
+        "Missing Azure Storage env vars: AZURE_STORAGE_ACCOUNT_NAME, AZURE_BLOB_KEY, AZURE_CONTAINER_NAME"
+    )
 AZURE_ACCOUNT_URL = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
 
 # ---------- DB ----------
@@ -56,9 +59,8 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(255), nullable=False)
-    first_name = db.Column(db.String(80), nullable=True)  
-    last_name = db.Column(db.String(80), nullable=True)   
-
+    first_name = db.Column(db.String(80), nullable=True)
+    last_name = db.Column(db.String(80), nullable=True)
 
 # ---------- Helpers ----------
 def make_token(user_id: int) -> str:
@@ -85,7 +87,6 @@ def token_required(fn):
     return wrapper
 
 def get_blob_service() -> BlobServiceClient:
-    # Use Account Key auth
     return BlobServiceClient(account_url=AZURE_ACCOUNT_URL, credential=AZURE_BLOB_KEY)
 
 # ---------- Auth Routes ----------
@@ -121,7 +122,6 @@ def signup():
                  "first_name": user.first_name, "last_name": user.last_name}
     }), 200
 
-
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.get_json(force=True) or {}
@@ -148,7 +148,6 @@ def list_state_files():
 
         items = []
         for blob in container_client.list_blobs():
-            # Only .tfstate files
             if not blob.name.endswith(".tfstate"):
                 continue
             items.append({
@@ -157,28 +156,23 @@ def list_state_files():
                 "last_modified": blob.last_modified.isoformat() if getattr(blob, "last_modified", None) else None
             })
 
-        # Sort by last_modified desc if available
         items.sort(key=lambda x: x["last_modified"] or "", reverse=True)
         return jsonify({"states": items}), 200
-
     except Exception as e:
-        # Do not print secrets, just log generic error
         print(f"[list_state_files] Error: {e}")
         return jsonify({"error": "Failed to list state files"}), 500
 
 @app.route("/api/states/<path:blob_name>/url", methods=["GET"])
 @token_required
 def get_state_sas_url(blob_name: str):
-    """Return a short-lived SAS URL for a specific state file."""
     try:
-        # Generate read-only SAS valid for 10 minutes
         sas_token = generate_blob_sas(
             account_name=AZURE_STORAGE_ACCOUNT_NAME,
             container_name=AZURE_CONTAINER_NAME,
             blob_name=blob_name,
             account_key=AZURE_BLOB_KEY,
             permission=BlobSasPermissions(read=True),
-            expiry=datetime.utcnow() + timedelta(minutes=10)
+            expiry=datetime.utcnow() + timedelta(minutes=10),
         )
         url = f"{AZURE_ACCOUNT_URL}/{AZURE_CONTAINER_NAME}/{blob_name}?{sas_token}"
         return jsonify({"url": url, "expires_in_minutes": 10}), 200
@@ -192,10 +186,7 @@ def get_state_sas_url(blob_name: str):
 def protected():
     return jsonify({"ok": True}), 200
 
-
-
-# ----------- Get info about user ----------
-
+# ---------- Get info about user ----------
 @app.route("/api/me", methods=["GET"])
 @token_required
 def me():
@@ -211,6 +202,43 @@ def me():
         "first_name": user.first_name,
         "last_name": user.last_name
     }), 200
+
+# ---------- Modules & Lab creation (GitLab) ----------
+@app.route("/api/modules", methods=["GET"])
+@token_required
+def list_modules():
+    modules = [{"name": k, "title": v["title"]} for k, v in MODULE_SCHEMAS.items()]
+    return jsonify({"modules": modules}), 200
+
+@app.route("/api/modules/<name>/schema", methods=["GET"])
+@token_required
+def get_module_schema(name):
+    schema = MODULE_SCHEMAS.get(name)
+    if not schema:
+        return jsonify({"error": "Unknown module"}), 404
+    return jsonify(schema), 200
+
+@app.route("/api/labs/create", methods=["POST"])
+@token_required
+def create_lab():
+    body = request.get_json(force=True) or {}
+    course = (body.get("course") or "").strip().lower()
+    lab_name = (body.get("lab_name") or "").strip().lower()
+    module_name = body.get("module_name")
+    params = body.get("params") or {}
+    branch = body.get("branch", "main")
+
+    if not (course and lab_name and module_name):
+        return jsonify({"error": "Missing required fields"}), 400
+    if module_name not in MODULE_SCHEMAS:
+        return jsonify({"error": "Unknown module"}), 400
+
+    try:
+        folder = create_lab_in_gitlab(course, lab_name, module_name, params, branch)
+        return jsonify({"ok": True, "lab_path": folder}), 200
+    except Exception as e:
+        print(f"[create_lab] Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 # ---------- Main ----------
 if __name__ == "__main__":
