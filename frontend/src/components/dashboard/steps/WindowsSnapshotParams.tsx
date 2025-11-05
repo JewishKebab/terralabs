@@ -1,13 +1,10 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import axios, { AxiosHeaders } from "axios";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import {
-  Select, SelectTrigger, SelectContent, SelectItem, SelectValue,
-} from "@/components/ui/select";
 import { Card } from "@/components/ui/card";
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { Loader2, Plus, Trash2 } from "lucide-react";
 
@@ -18,11 +15,17 @@ type Disk = {
   disk_size_gb: number;
 };
 
+// ✅ Helper to remove `.tfstate` and any folder prefix
+const cleanLabName = (name: string) => {
+  const last = (name || "").split("/").pop() || name;
+  return last.replace(/\.tfstate$/i, "");
+};
+
 export default function WindowsSnapshotParams({
-  course,          // e.g. "devops"
-  labName,         // e.g. "win-snap-lab1"
-  onBack,          // () => void
-  onDone,          // (r:any) => void
+  course,
+  labName,
+  onBack,
+  onDone,
 }: {
   course: string;
   labName: string;
@@ -32,12 +35,16 @@ export default function WindowsSnapshotParams({
   const { toast } = useToast();
   const [loading, setLoading] = useState(false);
 
-  // form state
-  const [vmName, setVmName] = useState("labvm");
+  const cleanedLabName = cleanLabName(labName);
+  const [derivedVmName, setDerivedVmName] = useState(`Projects-${cleanedLabName}-VM`);
+
+  useEffect(() => {
+    setDerivedVmName(`Projects-${cleanLabName(labName)}-VM`);
+  }, [labName]);
+
+  // State for other fields
   const [vmCount, setVmCount] = useState<number>(1);
   const [vmSize, setVmSize] = useState("Standard_D2s_v5");
-  const [rgName, setRgName] = useState("");
-  const [subnetId, setSubnetId] = useState("");
   const [snapshotId, setSnapshotId] = useState("");
   const [disks, setDisks] = useState<Disk[]>([]);
 
@@ -67,8 +74,12 @@ export default function WindowsSnapshotParams({
     setDisks((d) => d.map((x, i) => (i === idx ? { ...x, ...patch } : x)));
 
   const handleSubmit = async () => {
-    if (!vmName || !rgName || !subnetId || !snapshotId || !vmSize || vmCount <= 0) {
-      toast({ variant: "destructive", title: "Missing fields", description: "Fill all required fields." });
+    if (!snapshotId || !vmSize || vmCount <= 0) {
+      toast({
+        variant: "destructive",
+        title: "Missing fields",
+        description: "Fill all required fields.",
+      });
       return;
     }
 
@@ -76,22 +87,36 @@ export default function WindowsSnapshotParams({
     try {
       const payload = {
         course,
-        lab_name: labName,
+        lab_name: labName, // still the full name with .tfstate (needed for backend)
         module_name: "WindowsSnapshot",
         params: {
-          vm_name: vmName,
           vm_count: vmCount,
           vm_size: vmSize,
-          resource_group_name: rgName,
-          subnet_id: subnetId,
-          os_snapshot_id: snapshotId,
-          data_disks: disks, // [] by default
+          snapshot_id: snapshotId,
+          data_disks: disks,
         },
       };
 
-      const res = await api.post("/api/labs/create", payload);
-      toast({ title: "Lab created", description: res?.data?.lab_path ?? "Pushed to GitLab." });
-      onDone(res.data);
+        const res = await api.post("/api/labs/create", payload);
+
+        toast({
+        title: "Terraform Lab Created",
+        description: res?.data?.merge_request_url ? (
+            <a
+            href={res.data.merge_request_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-primary underline"
+            >
+            View Merge Request in GitLab
+            </a>
+        ) : (
+            "Merge request created in GitLab."
+        ),
+        });
+
+        onDone(res.data);
+
     } catch (err: any) {
       const msg = err?.response?.data?.error || err?.message || "Failed to create lab.";
       toast({ variant: "destructive", title: "Error", description: msg });
@@ -102,24 +127,37 @@ export default function WindowsSnapshotParams({
 
   return (
     <div className="space-y-6">
+      {/* 🧠 Header Info */}
       <Card className="p-4">
         <div className="text-sm text-muted-foreground">
-          <div><span className="font-medium text-foreground">Course:</span> {course}</div>
-          <div><span className="font-medium text-foreground">Lab:</span> {labName}</div>
-          <div><span className="font-medium text-foreground">Module:</span> Snapshot Virtual Machine</div>
+          <div>
+            <span className="font-medium text-foreground">Course:</span> {course}
+          </div>
+          <div>
+            <span className="font-medium text-foreground">Lab:</span> {cleanedLabName}
+          </div>
+          <div>
+            <span className="font-medium text-foreground">Module:</span> Snapshot Virtual Machine
+          </div>
         </div>
       </Card>
 
+      {/* VM Name derived */}
+      <div className="space-y-2">
+        <Label>VM Name (derived)</Label>
+        <Input value={derivedVmName} readOnly />
+      </div>
+
+      {/* Remaining form as before */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="space-y-2">
-          <Label htmlFor="vm_name">VM Base Name *</Label>
-          <Input id="vm_name" value={vmName} onChange={(e) => setVmName(e.target.value)} placeholder="labvm" />
-        </div>
-
-        <div className="space-y-2">
-          <Label htmlFor="vm_count">VM Count *</Label>
-          <Input id="vm_count" type="number" min={1} value={vmCount}
-                 onChange={(e) => setVmCount(Number(e.target.value || 0))} />
+          <Label>VM Count *</Label>
+          <Input
+            type="number"
+            min={1}
+            value={vmCount}
+            onChange={(e) => setVmCount(Number(e.target.value || 0))}
+          />
         </div>
 
         <div className="space-y-2">
@@ -135,28 +173,23 @@ export default function WindowsSnapshotParams({
           </Select>
         </div>
 
-        <div className="space-y-2">
-          <Label htmlFor="rg">Resource Group *</Label>
-          <Input id="rg" value={rgName} onChange={(e) => setRgName(e.target.value)} placeholder="rg-terralabs-we" />
-        </div>
-
         <div className="md:col-span-2 space-y-2">
-          <Label htmlFor="subnet">Subnet ID *</Label>
-          <Textarea id="subnet" value={subnetId} onChange={(e) => setSubnetId(e.target.value)}
-                    placeholder="/subscriptions/.../resourceGroups/.../providers/Microsoft.Network/virtualNetworks/.../subnets/..." />
-        </div>
-
-        <div className="md:col-span-2 space-y-2">
-          <Label htmlFor="snap">OS Snapshot Resource ID *</Label>
-          <Textarea id="snap" value={snapshotId} onChange={(e) => setSnapshotId(e.target.value)}
-                    placeholder="/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/snapshots/..." />
+          <Label>OS Snapshot Resource ID *</Label>
+          <Input
+            placeholder="/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/snapshots/..."
+            value={snapshotId}
+            onChange={(e) => setSnapshotId(e.target.value)}
+          />
         </div>
       </div>
 
+      {/* Optional data disks */}
       <div className="space-y-3">
         <div className="flex items-center justify-between">
           <Label>Data Disks (optional)</Label>
-          <Button type="button" variant="secondary" onClick={addDisk}><Plus className="w-4 h-4 mr-1" /> Add Disk</Button>
+          <Button type="button" variant="secondary" onClick={addDisk}>
+            <Plus className="w-4 h-4 mr-1" /> Add Disk
+          </Button>
         </div>
 
         {disks.length === 0 ? (
@@ -172,8 +205,12 @@ export default function WindowsSnapshotParams({
                   </div>
                   <div className="space-y-1">
                     <Label>LUN</Label>
-                    <Input type="number" min={0} value={d.lun}
-                           onChange={(e) => updateDisk(i, { lun: Number(e.target.value || 0) })} />
+                    <Input
+                      type="number"
+                      min={0}
+                      value={d.lun}
+                      onChange={(e) => updateDisk(i, { lun: Number(e.target.value || 0) })}
+                    />
                   </div>
                   <div className="space-y-1">
                     <Label>Caching</Label>
@@ -188,11 +225,22 @@ export default function WindowsSnapshotParams({
                   </div>
                   <div className="space-y-1">
                     <Label>Size (GB)</Label>
-                    <Input type="number" min={1} value={d.disk_size_gb}
-                           onChange={(e) => updateDisk(i, { disk_size_gb: Number(e.target.value || 0) })} />
+                    <Input
+                      type="number"
+                      min={1}
+                      value={d.disk_size_gb}
+                      onChange={(e) =>
+                        updateDisk(i, { disk_size_gb: Number(e.target.value || 0) })
+                      }
+                    />
                   </div>
                   <div className="flex items-end">
-                    <Button type="button" variant="destructive" onClick={() => removeDisk(i)} className="w-full">
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      onClick={() => removeDisk(i)}
+                      className="w-full"
+                    >
                       <Trash2 className="w-4 h-4 mr-1" /> Remove
                     </Button>
                   </div>
@@ -204,9 +252,17 @@ export default function WindowsSnapshotParams({
       </div>
 
       <div className="flex gap-3">
-        <Button type="button" variant="outline" onClick={onBack}>Previous</Button>
+        <Button type="button" variant="outline" onClick={onBack}>
+          Previous
+        </Button>
         <Button className="ml-auto" onClick={handleSubmit} disabled={loading}>
-          {loading ? (<><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Creating…</>) : "Create GitLab Request"}
+          {loading ? (
+            <>
+              <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Creating…
+            </>
+          ) : (
+            "Create GitLab Request"
+          )}
         </Button>
       </div>
     </div>

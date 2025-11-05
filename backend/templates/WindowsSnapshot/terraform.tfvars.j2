@@ -1,4 +1,21 @@
-vm_name             = "Projects-Devops-Server"
+# backend/templates/WindowsSnapshot/terraform.tfvars.j2
 
-vm_count = 1
-image_id = "/subscriptions/89641046-9c08-41ad-954a-7ff2f2d626f7/resourceGroups/Projects-Devops-Cloud-Exercise/providers/Microsoft.Compute/images/Sys-Clean-WinServer"
+# Derived VM name (strip ".tfstate" if present)
+server_vm_name = "Projects-{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}-VM"
+
+vm_count    = {{ tf_vars.vm_count }}
+vm_size     = "{{ tf_vars.vm_size }}"
+snapshot_id = "{{ tf_vars.snapshot_id }}"
+
+data_disks = [
+{% if tf_vars.data_disks and tf_vars.data_disks|length > 0 -%}
+{%- for d in tf_vars.data_disks -%}
+  {
+    name         = "{{ d.name }}",
+    lun          = {{ d.lun }},
+    caching      = "{{ d.caching }}",
+    disk_size_gb = {{ d.disk_size_gb }}
+  }{{ "," if not loop.last }}
+{%- endfor -%}
+{%- endif -%}
+]

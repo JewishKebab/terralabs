@@ -7,24 +7,15 @@ variable "vm_count" {
   type        = number
 }
 
-variable "vm_name" {
-  description = "Base name for the virtual machine(s)."
-  type        = string
-}
+
 
 variable "vm_size" {
   description = "The Azure VM size."
   type        = string
 }
 
-variable "resource_group_name" {
-  description = "The name of the resource group where the VMs will be created."
-  type        = string
-}
-
-variable "subnet_id" {
-  description = "The ID of the subnet where the NIC will be placed."
-  type        = string
+variable "vm_name" {
+  description = "The Azure VM Name."
 }
 
 variable "os_snapshot_id" {
@@ -42,9 +33,4 @@ variable "data_disks" {
     disk_size_gb = number
   }))
   default = []
-}
-
-variable "vm_name" {
-  description = "The logical server name to use for VM naming (used in module call)."
-  type        = string
 }

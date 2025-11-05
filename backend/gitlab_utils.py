@@ -1,5 +1,9 @@
-import os, json, requests, urllib.parse
+import os, json, requests, urllib.parse, urllib3
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+# --- Disable SSL warnings & verification ---
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+REQUESTS_VERIFY = False
 
 # --- GitLab env vars ---
 GITLAB_HOST = os.getenv("GITLAB_HOST", "https://gitlab.com")
@@ -15,7 +19,8 @@ jinja = Environment(
 )
 jinja.filters["tojson"] = lambda value: json.dumps(value, indent=2)
 
-# --- Schema registry (extend later if needed) ---
+
+# --- Schema registry ---
 MODULE_SCHEMAS = {
     "WindowsSnapshot": {
         "title": "Windows VM from Snapshot",
@@ -44,26 +49,76 @@ MODULE_SCHEMAS = {
 
 
 # --- GitLab helper ---
-def gitlab_upsert_file(path: str, content: str, commit_message: str, branch="main"):
+def ensure_branch(branch: str, base_branch: str = "main"):
+    """Create a branch if it doesn’t exist."""
+    headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
+    branch_url = f"{GITLAB_API}/projects/{GITLAB_PROJECT_ID}/repository/branches/{urllib.parse.quote(branch, safe='')}"
+
+    exists = requests.get(branch_url, headers=headers, verify=REQUESTS_VERIFY)
+    if exists.status_code == 200:
+        return  # already exists
+
+    # Create new branch from base_branch
+    create_url = f"{GITLAB_API}/projects/{GITLAB_PROJECT_ID}/repository/branches"
+    res = requests.post(
+        create_url,
+        headers=headers,
+        json={"branch": branch, "ref": base_branch},
+        verify=REQUESTS_VERIFY,
+    )
+    if res.status_code not in (200, 201):
+        raise RuntimeError(f"Failed to create branch {branch}: {res.status_code} {res.text}")
+
+
+def gitlab_upsert_file(path: str, content: str, commit_message: str, branch: str):
+    """Create or update a file in GitLab in a given branch."""
     if not (GITLAB_PROJECT_ID and GITLAB_TOKEN):
         raise RuntimeError("Missing GitLab configuration")
 
     url = f"{GITLAB_API}/projects/{GITLAB_PROJECT_ID}/repository/files/{urllib.parse.quote(path, safe='')}"
     headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
-    data = {"branch": branch, "content": content, "commit_message": commit_message, "encoding": "text"}
+    data = {
+        "branch": branch,
+        "content": content,
+        "commit_message": commit_message,
+        "encoding": "text"
+    }
 
-    exists = requests.get(url, headers=headers, params={"ref": branch})
+    exists = requests.get(url, headers=headers, params={"ref": branch}, verify=REQUESTS_VERIFY)
     if exists.status_code == 200:
-        res = requests.put(url, headers=headers, data=data)
+        res = requests.put(url, headers=headers, data=data, verify=REQUESTS_VERIFY)
     else:
-        res = requests.post(url, headers=headers, data=data)
+        res = requests.post(url, headers=headers, data=data, verify=REQUESTS_VERIFY)
 
     if res.status_code not in (200, 201):
         raise RuntimeError(f"GitLab upsert failed for {path}: {res.status_code} {res.text}")
 
 
+def create_merge_request(source_branch: str, target_branch: str = "main", title: str = None):
+    """Create a merge request for the new branch."""
+    headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
+    url = f"{GITLAB_API}/projects/{GITLAB_PROJECT_ID}/merge_requests"
+
+    payload = {
+        "source_branch": source_branch,
+        "target_branch": target_branch,
+        "title": title or f"[TerraLabs] {source_branch}",
+        "remove_source_branch": True,
+    }
+
+    res = requests.post(url, headers=headers, json=payload, verify=REQUESTS_VERIFY)
+    if res.status_code not in (200, 201):
+        raise RuntimeError(f"Failed to create merge request: {res.status_code} {res.text}")
+
+    return res.json().get("web_url")
+
+
 # --- Main lab creation ---
-def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: dict, branch="main"):
+def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: dict, base_branch="main"):
+    """Renders templates and commits them to a new branch in GitLab."""
+    if not (GITLAB_PROJECT_ID and GITLAB_TOKEN):
+        raise RuntimeError("Missing GitLab configuration")
+
     ctx = {
         "course": course,
         "lab_name": lab_name,
@@ -73,6 +128,10 @@ def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: d
 
     module_path = os.path.join(module_name)
     lab_folder = f"Labs/{course}/{lab_name}"
+    branch_name = f"labs/{course}/{lab_name}".replace(" ", "-").lower()
+
+    # --- ensure new branch exists ---
+    ensure_branch(branch_name, base_branch)
 
     def render_from(module_dir: str, filename: str, context: dict):
         path = f"{module_dir}/{filename}"
@@ -90,6 +149,13 @@ def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: d
     }
 
     for path, content in files.items():
-        gitlab_upsert_file(path, content, f"[TerraLabs] Create {course}/{lab_name}", branch)
+        gitlab_upsert_file(path, content, f"[TerraLabs] Create {course}/{lab_name}", branch_name)
 
-    return lab_folder
+    # --- Create MR automatically ---
+    mr_url = create_merge_request(branch_name, base_branch, f"[TerraLabs] {course}/{lab_name}")
+
+    return {
+        "lab_folder": lab_folder,
+        "branch": branch_name,
+        "merge_request_url": mr_url,
+    }

@@ -1,25 +1,31 @@
 data "azurerm_resource_group" "terralabs-rg" {
-  name = "SharedServices-TerraLabs-RG"
+  name = "Projects-TerraLabs-RG"
+  provider = azurerm.Projects
 }
 
 data "azurerm_virtual_network" "terralabs-vnet" {
   resource_group_name = data.azurerm_resource_group.terralabs-rg.name
-  name = "SharedServices-TerraLabs-VNet"
+  name = "Projects-TerraLabs-VNet"
+  provider = azurerm.Projects
 }
 
 data "azurerm_subnet" "terralabs-snet" {
   resource_group_name = data.azurerm_resource_group.terralabs-rg.name
   virtual_network_name = data.azurerm_virtual_network.terralabs-vnet.name
-  name = "SharedServices-TerraLabs-SNet"
+  name = "Projects-TerraLabs-SNet"
+  provider = azurerm.Projects
 }
 
 module "VMs" {
-  source = "../../Modules/WindowsSnapshot"
+  source = "../../../Modules/WindowsSnapshot"
   vm_count = var.vm_count
   subnet_id = data.azurerm_subnet.terralabs-snet.id
   vm_size = var.vm_size
   resource_group_name = data.azurerm_resource_group.terralabs-rg.name
-  vm_name = var.server_vm_name
+  vm_name = var.vm_name
   data_disks = var.data_disks
   os_snapshot_id = var.snapshot_id
+  providers = {
+  azurerm = azurerm.Projects
+  }
 }

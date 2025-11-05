@@ -219,25 +219,30 @@ def get_module_schema(name):
     return jsonify(schema), 200
 
 @app.route("/api/labs/create", methods=["POST"])
-@token_required
 def create_lab():
-    body = request.get_json(force=True) or {}
-    course = (body.get("course") or "").strip().lower()
-    lab_name = (body.get("lab_name") or "").strip().lower()
-    module_name = body.get("module_name")
-    params = body.get("params") or {}
-    branch = body.get("branch", "main")
-
-    if not (course and lab_name and module_name):
-        return jsonify({"error": "Missing required fields"}), 400
-    if module_name not in MODULE_SCHEMAS:
-        return jsonify({"error": "Unknown module"}), 400
-
     try:
-        folder = create_lab_in_gitlab(course, lab_name, module_name, params, branch)
-        return jsonify({"ok": True, "lab_path": folder}), 200
+        data = request.get_json()
+        course = data.get("course")
+        lab_name = data.get("lab_name")
+        module_name = data.get("module_name")
+        params = data.get("params", {})
+
+        if not all([course, lab_name, module_name]):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        # Call your GitLab function (creates new branch + MR)
+        result = create_lab_in_gitlab(course, lab_name, module_name, params)
+
+        return jsonify({
+            "message": f"Lab {lab_name} created successfully",
+            "lab_folder": result["lab_folder"],
+            "branch": result["branch"],
+            "merge_request_url": result["merge_request_url"]
+        }), 200
+
     except Exception as e:
-        print(f"[create_lab] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 # ---------- Main ----------

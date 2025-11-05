@@ -1,4 +1,3 @@
-// frontend/src/components/dashboard/steps/ParameterConfiguration.tsx
 import WindowsSnapshotParams from "./WindowsSnapshotParams";
 
 type Props = {
