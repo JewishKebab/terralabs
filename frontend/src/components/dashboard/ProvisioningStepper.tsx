@@ -1,114 +1,139 @@
 import { useState } from "react";
-import { Check, ChevronRight } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { BackendSelection } from "./steps/BackendSelection";
-import { ModuleSelection } from "./steps/ModuleSelection";
-import { ParameterConfiguration } from "./steps/ParameterConfiguration";
+import axios from "axios";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import { useToast } from "@/hooks/use-toast";
 
-const steps = [
-  { id: 1, name: "Backend", description: "Choose or create backend" },
-  { id: 2, name: "Module", description: "Select module" },
-  { id: 3, name: "Parameters", description: "Configure parameters" },
-];
+interface Props {
+  backend: string;
+  module: string;
+  onBack: () => void;
+  onComplete: () => void;
+}
 
-export function ProvisioningStepper() {
-  const [currentStep, setCurrentStep] = useState(1);
-  const [backendData, setBackendData] = useState<string | null>(null);
-  const [moduleData, setModuleData] = useState<string | null>(null);
+export default function ParameterConfiguration({
+  backend,
+  module,
+  onBack,
+  onComplete,
+}: Props) {
+  const { toast } = useToast();
 
-  const handleBackendComplete = (backend: string) => {
-    setBackendData(backend);
-    setCurrentStep(2);
-  };
+  // Form state for Windows Snapshot module
+  const [vmName, setVmName] = useState("");
+  const [vmCount, setVmCount] = useState(1);
+  const [vmSize, setVmSize] = useState("Standard_DS2_v2");
+  const [snapshotId, setSnapshotId] = useState("");
 
-  const handleModuleComplete = (module: string) => {
-    setModuleData(module);
-    setCurrentStep(3);
-  };
+  const [loading, setLoading] = useState(false);
 
-  const handleParametersComplete = () => {
-    // This will be implemented later for GitLab MR creation
-    console.log("Parameters submitted");
-  };
+  const handleSubmit = async () => {
+    if (!vmName || !snapshotId) {
+      toast({
+        title: "Missing Required Values",
+        description: "Please fill in all fields.",
+        variant: "destructive",
+      });
+      return;
+    }
 
-  const handleStepClick = (stepId: number) => {
-    // Allow navigation to completed steps
-    if (stepId < currentStep) {
-      setCurrentStep(stepId);
+    try {
+      setLoading(true);
+      const token = localStorage.getItem("auth_token");
+
+      await axios.post(
+        "http://localhost:5000/api/labs",
+        {
+          backend_name: backend,
+          course_name: "devops", // Hardcoded for now until UI selection
+          module_name: module,
+          parameters: {
+            vm_name: vmName,
+            vm_count: vmCount,
+            vm_size: vmSize,
+            snapshot_id: snapshotId,
+          },
+        },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      toast({
+        title: "Terraform Lab Created",
+        description: "Merge request created in GitLab.",
+      });
+
+      onComplete();
+    } catch (err: any) {
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: err?.response?.data?.error || "Failed to create lab.",
+      });
+    } finally {
+      setLoading(false);
     }
   };
 
   return (
-    <div className="space-y-8">
-      {/* Stepper Header */}
-      <div className="flex items-center justify-between">
-        {steps.map((step, index) => (
-          <div key={step.id} className="flex items-center flex-1">
-            <div className="flex flex-col items-center">
-              <button
-                onClick={() => handleStepClick(step.id)}
-                disabled={step.id > currentStep}
-                className={cn(
-                  "h-10 w-10 rounded-full flex items-center justify-center font-semibold transition-all",
-                  currentStep > step.id
-                    ? "bg-primary text-primary-foreground shadow-glow cursor-pointer hover:opacity-80"
-                    : currentStep === step.id
-                    ? "bg-gradient-primary text-primary-foreground shadow-glow"
-                    : "bg-muted text-muted-foreground cursor-not-allowed"
-                )}
-              >
-                {currentStep > step.id ? (
-                  <Check className="h-5 w-5" />
-                ) : (
-                  step.id
-                )}
-              </button>
-              <div className="mt-2 text-center">
-                <p className="text-sm font-medium">{step.name}</p>
-                <p className="text-xs text-muted-foreground">{step.description}</p>
-              </div>
-            </div>
-            {index < steps.length - 1 && (
-              <div
-                className={cn(
-                  "flex-1 h-0.5 mx-4 transition-all",
-                  currentStep > step.id ? "bg-primary" : "bg-border"
-                )}
-              >
-                <ChevronRight className="h-4 w-4 text-muted-foreground mx-auto -mt-2" />
-              </div>
-            )}
-          </div>
-        ))}
+    <div className="space-y-6">
+      {/* Summary */}
+      <div className="bg-muted p-4 rounded-md text-sm text-muted-foreground">
+        <div><strong>Backend:</strong> {backend}</div>
+        <div><strong>Module:</strong> {module}</div>
       </div>
 
-      {/* Step Content */}
-      <Card className="shadow-elegant">
-        <CardHeader>
-          <CardTitle>{steps[currentStep - 1].name}</CardTitle>
-          <CardDescription>{steps[currentStep - 1].description}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {currentStep === 1 && (
-            <BackendSelection onComplete={handleBackendComplete} />
-          )}
-          {currentStep === 2 && (
-            <ModuleSelection 
-              onComplete={handleModuleComplete}
-              onBack={() => setCurrentStep(1)}
-            />
-          )}
-          {currentStep === 3 && (
-            <ParameterConfiguration
-              backend={backendData!}
-              module={moduleData!}
-              onComplete={handleParametersComplete}
-              onBack={() => setCurrentStep(2)}
-            />
-          )}
-        </CardContent>
-      </Card>
+      {/* VM Name */}
+      <div className="space-y-2">
+        <Label>VM Name *</Label>
+        <Input
+          placeholder="lab-vm"
+          value={vmName}
+          onChange={(e) => setVmName(e.target.value)}
+        />
+      </div>
+
+      {/* VM Count */}
+      <div className="space-y-2">
+        <Label>VM Count *</Label>
+        <Input
+          type="number"
+          value={vmCount}
+          min={1}
+          onChange={(e) => setVmCount(Number(e.target.value))}
+        />
+      </div>
+
+      {/* VM Size */}
+      <div className="space-y-2">
+        <Label>VM Size *</Label>
+        <Input
+          placeholder="Standard_DS2_v2"
+          value={vmSize}
+          onChange={(e) => setVmSize(e.target.value)}
+        />
+      </div>
+
+      {/* Snapshot ID */}
+      <div className="space-y-2">
+        <Label>Snapshot Resource ID *</Label>
+        <Input
+          placeholder="/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/snapshots/yourSnapshot"
+          value={snapshotId}
+          onChange={(e) => setSnapshotId(e.target.value)}
+        />
+      </div>
+
+      {/* Buttons */}
+      <div className="flex justify-between pt-4">
+        <Button variant="outline" onClick={onBack}>
+          ← Back
+        </Button>
+
+        <Button onClick={handleSubmit} disabled={loading}>
+          {loading ? "Creating..." : "Create GitLab Merge Request"}
+        </Button>
+      </div>
     </div>
   );
 }
