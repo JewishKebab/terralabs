@@ -28,4 +28,5 @@ module "VMs" {
   providers = {
   azurerm = azurerm.Projects
   }
+  computer_name = ""
 }
