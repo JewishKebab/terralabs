@@ -3,22 +3,34 @@ from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 from dotenv import load_dotenv
-import jwt, datetime, os
+from functools import wraps
+from datetime import datetime, timedelta
+import jwt, os
 
+# Azure Blob
+from azure.storage.blob import (
+    BlobServiceClient,
+    BlobSasPermissions,
+    generate_blob_sas
+)
+
+# ---------- Load env ----------
 load_dotenv()
-app = Flask(__name__)
 
-# CORS must be set right after app creation
+# ---------- Flask / CORS ----------
+app = Flask(__name__)
 CORS(
     app,
     resources={r"/api/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080"]}},
     supports_credentials=False,
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"],
+    methods=["GET", "POST", "OPTIONS"]
 )
 
+# ---------- Config ----------
 app.config["SECRET_KEY"] = os.environ.get("JWT_SECRET", "fallback-secret")
 
+# Postgres (Azure) — make sure these are set
 host = os.environ.get("AZURE_SQL_HOST")
 user = os.environ.get("AZURE_SQL_USER")
 password = os.environ.get("AZURE_SQL_PASSWORD")
@@ -26,6 +38,17 @@ db_name = os.environ.get("AZURE_SQL_DB")
 app.config["SQLALCHEMY_DATABASE_URI"] = f"postgresql://{user}:{password}@{host}/{db_name}"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+# Azure Storage env
+AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
+AZURE_BLOB_KEY = os.environ.get("AZURE_BLOB_KEY")
+AZURE_CONTAINER_NAME = os.environ.get("AZURE_CONTAINER_NAME")
+
+if not (AZURE_STORAGE_ACCOUNT_NAME and AZURE_BLOB_KEY and AZURE_CONTAINER_NAME):
+    raise RuntimeError("Missing Azure Storage env vars: AZURE_STORAGE_ACCOUNT_NAME, AZURE_BLOB_KEY, AZURE_CONTAINER_NAME")
+
+AZURE_ACCOUNT_URL = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+
+# ---------- DB ----------
 db = SQLAlchemy(app)
 
 class User(db.Model):
@@ -34,27 +57,55 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(255), nullable=False)
 
+# ---------- Helpers ----------
 def make_token(user_id: int) -> str:
     return jwt.encode(
-        {"user_id": user_id, "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)},
+        {"user_id": user_id, "exp": datetime.utcnow() + timedelta(hours=24)},
         app.config["SECRET_KEY"],
         algorithm="HS256",
     )
 
+def token_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Missing or invalid Authorization header"}), 401
+        token = auth.split(" ", 1)[1]
+        try:
+            jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token expired"}), 401
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+def get_blob_service() -> BlobServiceClient:
+    # Use Account Key auth
+    return BlobServiceClient(account_url=AZURE_ACCOUNT_URL, credential=AZURE_BLOB_KEY)
+
+# ---------- Auth Routes ----------
 @app.route("/api/signup", methods=["POST"])
 def signup():
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip()
-    password = data.get("password") or ""
-    if not email or not password:
+    password_plain = data.get("password") or ""
+
+    if not email or not password_plain:
         return jsonify({"error": "Email and password required"}), 400
+
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "User already exists"}), 400
 
-    hashed = generate_password_hash(password)
-    user = User(email=email, password=hashed)
-    db.session.add(user)
-    db.session.commit()
+    hashed_password = generate_password_hash(password_plain)
+    user = User(email=email, password=hashed_password)
+    try:
+        db.session.add(user)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify({"error": "Database error"}), 500
 
     token = make_token(user.id)
     return jsonify({"token": token, "redirect_url": "/dashboard"}), 200
@@ -63,31 +114,73 @@ def signup():
 def login():
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip()
-    password = data.get("password") or ""
-    if not email or not password:
+    password_plain = data.get("password") or ""
+
+    if not email or not password_plain:
         return jsonify({"error": "Email and password required"}), 400
 
     user = User.query.filter_by(email=email).first()
-    if not user or not check_password_hash(user.password, password):
+    if not user or not check_password_hash(user.password, password_plain):
         return jsonify({"error": "Invalid credentials"}), 401
 
     token = make_token(user.id)
     return jsonify({"token": token, "redirect_url": "/dashboard"}), 200
 
-@app.route("/api/protected")
-def protected():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"error": "Missing token"}), 401
-    token = auth.split(" ", 1)[1]
+# ---------- Azure Blob Routes ----------
+@app.route("/api/states", methods=["GET"])
+@token_required
+def list_state_files():
     try:
-        decoded = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-        return jsonify({"ok": True, "user_id": decoded["user_id"]})
-    except jwt.ExpiredSignatureError:
-        return jsonify({"error": "Token expired"}), 401
-    except Exception:
-        return jsonify({"error": "Invalid token"}), 401
+        blob_service = get_blob_service()
+        container_client = blob_service.get_container_client(AZURE_CONTAINER_NAME)
 
+        items = []
+        for blob in container_client.list_blobs():
+            # Only .tfstate files
+            if not blob.name.endswith(".tfstate"):
+                continue
+            items.append({
+                "name": blob.name,
+                "size": getattr(blob, "size", None),
+                "last_modified": blob.last_modified.isoformat() if getattr(blob, "last_modified", None) else None
+            })
+
+        # Sort by last_modified desc if available
+        items.sort(key=lambda x: x["last_modified"] or "", reverse=True)
+        return jsonify({"states": items}), 200
+
+    except Exception as e:
+        # Do not print secrets, just log generic error
+        print(f"[list_state_files] Error: {e}")
+        return jsonify({"error": "Failed to list state files"}), 500
+
+@app.route("/api/states/<path:blob_name>/url", methods=["GET"])
+@token_required
+def get_state_sas_url(blob_name: str):
+    """Return a short-lived SAS URL for a specific state file."""
+    try:
+        # Generate read-only SAS valid for 10 minutes
+        sas_token = generate_blob_sas(
+            account_name=AZURE_STORAGE_ACCOUNT_NAME,
+            container_name=AZURE_CONTAINER_NAME,
+            blob_name=blob_name,
+            account_key=AZURE_BLOB_KEY,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.utcnow() + timedelta(minutes=10)
+        )
+        url = f"{AZURE_ACCOUNT_URL}/{AZURE_CONTAINER_NAME}/{blob_name}?{sas_token}"
+        return jsonify({"url": url, "expires_in_minutes": 10}), 200
+    except Exception as e:
+        print(f"[get_state_sas_url] Error: {e}")
+        return jsonify({"error": "Failed to generate SAS URL"}), 500
+
+# ---------- Protected smoke test ----------
+@app.route("/api/protected", methods=["GET"])
+@token_required
+def protected():
+    return jsonify({"ok": True}), 200
+
+# ---------- Main ----------
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
