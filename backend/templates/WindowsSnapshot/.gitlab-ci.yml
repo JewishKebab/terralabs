@@ -12,8 +12,6 @@ stages:
 default:
   before_script:
     - echo "Preparing working directory"
-    - cp Providers/Azure/provider.tf $[[ inputs.workingDir ]]
-    - cp Providers/Azure/azurerm-provider-variables.tf $[[ inputs.workingDir ]]
     - cd $[[ inputs.workingDir ]]
     - echo "Working directory preparation completed."
 
