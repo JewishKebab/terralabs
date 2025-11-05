@@ -1,0 +1,8 @@
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "SharedServices-Bsmch-StorageAccounts-RG"
+    storage_account_name = "bsmchterraformbackendsa"
+    container_name       = "bsmch-terralabs-labs-container"
+    key                  = "{{ course }}/{{ lab_name }}/terraform.tfstate"
+  }
+}

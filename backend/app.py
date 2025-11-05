@@ -56,6 +56,9 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(255), nullable=False)
+    first_name = db.Column(db.String(80), nullable=True)  
+    last_name = db.Column(db.String(80), nullable=True)   
+
 
 # ---------- Helpers ----------
 def make_token(user_id: int) -> str:
@@ -91,15 +94,18 @@ def signup():
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip()
     password_plain = data.get("password") or ""
+    first_name = (data.get("first_name") or "").strip()
+    last_name = (data.get("last_name") or "").strip()
 
-    if not email or not password_plain:
-        return jsonify({"error": "Email and password required"}), 400
+    if not email or not password_plain or not first_name or not last_name:
+        return jsonify({"error": "Email, password, first_name and last_name are required"}), 400
 
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "User already exists"}), 400
 
     hashed_password = generate_password_hash(password_plain)
-    user = User(email=email, password=hashed_password)
+    user = User(email=email, password=hashed_password,
+                first_name=first_name, last_name=last_name)
     try:
         db.session.add(user)
         db.session.commit()
@@ -108,7 +114,13 @@ def signup():
         return jsonify({"error": "Database error"}), 500
 
     token = make_token(user.id)
-    return jsonify({"token": token, "redirect_url": "/dashboard"}), 200
+    return jsonify({
+        "token": token,
+        "redirect_url": "/dashboard",
+        "user": {"id": user.id, "email": user.email,
+                 "first_name": user.first_name, "last_name": user.last_name}
+    }), 200
+
 
 @app.route("/api/login", methods=["POST"])
 def login():
@@ -179,6 +191,26 @@ def get_state_sas_url(blob_name: str):
 @token_required
 def protected():
     return jsonify({"ok": True}), 200
+
+
+
+# ----------- Get info about user ----------
+
+@app.route("/api/me", methods=["GET"])
+@token_required
+def me():
+    auth = request.headers.get("Authorization", "")
+    token = auth.split(" ", 1)[1]
+    decoded = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+    user = User.query.get(decoded["user_id"])
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({
+        "id": user.id,
+        "email": user.email,
+        "first_name": user.first_name,
+        "last_name": user.last_name
+    }), 200
 
 # ---------- Main ----------
 if __name__ == "__main__":

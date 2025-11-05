@@ -1,0 +1,97 @@
+spec:
+  inputs:
+    counter:
+    workingDir:
+---
+stages:
+  - security-check
+  - plan
+  - apply
+  - destroy
+
+default:
+  before_script:
+    - echo "Preparing working directory"
+    - cp Providers/Azure/provider.tf $[[ inputs.workingDir ]]
+    - cp Providers/Azure/azurerm-provider-variables.tf $[[ inputs.workingDir ]]
+    - cd $[[ inputs.workingDir ]]
+    - echo "Working directory preparation completed."
+
+# ---------------------------------------------------
+# SECURITY-CHECK (always on MR or main)
+"checkov_$[[ inputs.counter ]]":
+  stage: security-check
+  allow_failure: true
+  image:
+    name: bridgecrew/checkov:latest
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  script:
+    - checkov -d . -o cli
+  artifacts:
+    reports:
+      junit: "checkov.test.xml"
+    paths:
+      - "checkov.test.xml"
+  rules:
+    - when: always
+
+# ---------------------------------------------------
+# PLAN (always on MR or main)
+"plan_$[[ inputs.counter ]]":
+  stage: plan
+  image:
+    name: sharedservicesbsmchprodacr.azurecr.io/asgard/terraops:latest
+    entrypoint: ["/bin/sh", "-c"]
+  script:
+    - terraform init
+    - terraform plan -out=tfplan.binary
+    - terraform show -json tfplan.binary > plan.json
+    - infracost breakdown --path plan.json --format=table
+  artifacts:
+    paths:
+      - $[[ inputs.workingDir ]]/tfplan.binary
+    expire_in: 1 hour
+  rules:
+    - when: always
+
+# ----------------------------------------------------
+# APPLY (only once code lands in main)
+"apply_$[[ inputs.counter ]]":
+  stage: apply
+  allow_failure: true
+  image:
+    name: sharedservicesbsmchprodacr.azurecr.io/asgard/terraops:latest
+  dependencies:
+    - "plan_$[[ inputs.counter ]]"
+  script:
+    - echo "Running apply job"
+    - apk update && apk add --no-cache sshpass ansible
+    - pip install pywinrm>=0.4.0
+    - az login --service-principal -u $ARM_CLIENT_ID -p $ARM_CLIENT_SECRET --tenant $ARM_TENANT_ID
+    - az account set --subscription $ARM_SUBSCRIPTION_ID
+    - terraform init
+    - terraform apply -auto-approve tfplan.binary
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - when: never
+
+# ---------------------------------------------------
+# DESTROY (manual on main only)#
+"destroy_$[[ inputs.counter ]]":
+  stage: destroy
+  image:
+    name: sharedservicesbsmchprodacr.azurecr.io/asgard/terraops:latest
+    entrypoint: ["/bin/sh", "-c"]
+  dependencies:
+    - "apply_$[[ inputs.counter ]]"
+  script:
+    - terraform init
+    - terraform destroy -auto-approve
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual
+    - when: never
+

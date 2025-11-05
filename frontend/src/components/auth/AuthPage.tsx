@@ -30,6 +30,8 @@ const api = axios.create({
 const AuthPage = () => {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
   const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [showSignupPassword, setShowSignupPassword] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -62,10 +64,10 @@ const AuthPage = () => {
         if (!token) throw new Error("No token returned from server.");
         localStorage.setItem("auth_token", token);
 
+        // redirect
         navigate("/dashboard", { replace: true });
-        if (data.redirect_url) {
-          window.location.assign(data.redirect_url);
-        }
+        if (data.redirect_url) window.location.assign(data.redirect_url);
+
         toast({ title: "Signed in", description: "Welcome back!" });
       } catch (err) {
         toast({
@@ -86,10 +88,17 @@ const AuthPage = () => {
       if (loading) return;
       setLoading(true);
       try {
-        const data = await postJson("/api/signup", { email, password });
+        const payload = {
+          email,
+          password,
+          first_name: firstName,
+          last_name: lastName,
+        };
+        const data = await postJson("/api/signup", payload);
         const token = data?.token;
         if (!token) throw new Error("No token returned from server.");
         localStorage.setItem("auth_token", token);
+
         toast({ title: "Account created", description: "You’re all set!" });
         navigate("/dashboard");
       } catch (err) {
@@ -102,7 +111,7 @@ const AuthPage = () => {
         setLoading(false);
       }
     },
-    [email, password, loading, navigate, postJson, toast]
+    [email, password, firstName, lastName, loading, navigate, postJson, toast]
   );
 
   return (
@@ -159,9 +168,7 @@ const AuthPage = () => {
                       />
                       <button
                         type="button"
-                        onClick={() =>
-                          setShowLoginPassword((prev) => !prev)
-                        }
+                        onClick={() => setShowLoginPassword((prev) => !prev)}
                         className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
                         tabIndex={-1}
                       >
@@ -186,9 +193,31 @@ const AuthPage = () => {
                   </Button>
                 </form>
               </TabsContent>
-
+              
               {/* SIGNUP TAB */}
               <TabsContent value="signup">
+
+                                  {/* First / Last Name */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <Label htmlFor="signup-first">First name</Label>
+                      <Input
+                        id="signup-first"
+                        value={firstName}
+                        onChange={(e) => setFirstName(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="signup-last">Last name</Label>
+                      <Input
+                        id="signup-last"
+                        value={lastName}
+                        onChange={(e) => setLastName(e.target.value)}
+                        required
+                      />
+                    </div>
+                  </div>
                 <form onSubmit={handleSignup} className="space-y-4">
                   <div className="space-y-2">
                     <Label htmlFor="signup-email">Email</Label>
@@ -216,9 +245,7 @@ const AuthPage = () => {
                       />
                       <button
                         type="button"
-                        onClick={() =>
-                          setShowSignupPassword((prev) => !prev)
-                        }
+                        onClick={() => setShowSignupPassword((prev) => !prev)}
                         className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
                         tabIndex={-1}
                       >
