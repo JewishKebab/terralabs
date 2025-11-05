@@ -8,6 +8,11 @@ variable "vm_count" {
 }
 
 
+variable "computer_name" {
+  type        = string
+  description = "Computer name inside the OS."
+  default     = ""  
+}
 
 variable "vm_size" {
   description = "The Azure VM size."

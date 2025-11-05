@@ -1,7 +1,7 @@
 # backend/templates/WindowsSnapshot/terraform.tfvars.j2
 
 # Derived VM name (strip ".tfstate" if present)
-server_vm_name = "Projects-{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}-VM"
+vm_name = "Projects-{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}-VM"
 
 vm_count    = {{ tf_vars.vm_count }}
 vm_size     = "{{ tf_vars.vm_size }}"
