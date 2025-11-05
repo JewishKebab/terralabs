@@ -17,47 +17,19 @@ export function ModuleSelection({ onComplete, onBack }: ModuleSelectionProps) {
   // Mock data - in production, these would be loaded from source code
   const modules = [
     {
-      id: "vm-module",
-      name: "Virtual Machine",
-      description: "Deploy Azure Virtual Machines",
+      id: "vm-snapshot-module",
+      name: "Snapshot Virtual Machine",
+      description: "Deploy Azure Virtual Machines From Snapshot",
       icon: Server,
       color: "text-blue-500",
     },
     {
-      id: "storage-module",
-      name: "Storage Account",
-      description: "Create Azure Storage resources",
+      id: "vm-image-module",
+      name: "Image Virtual Machine",
+      description: "Deploy Azure Virtual Machines From Image",
       icon: Database,
       color: "text-green-500",
-    },
-    {
-      id: "network-module",
-      name: "Virtual Network",
-      description: "Configure Azure networking",
-      icon: Network,
-      color: "text-purple-500",
-    },
-    {
-      id: "container-module",
-      name: "Container Instance",
-      description: "Deploy containerized applications",
-      icon: Package,
-      color: "text-orange-500",
-    },
-    {
-      id: "lab-from-image",
-      name: "Lab from Image",
-      description: "Create lab environment from image",
-      icon: Image,
-      color: "text-cyan-500",
-    },
-    {
-      id: "lab-from-snapshot",
-      name: "Lab from Snapshot",
-      description: "Create lab environment from snapshot",
-      icon: Camera,
-      color: "text-pink-500",
-    },
+    }
   ];
 
   const handleSubmit = () => {

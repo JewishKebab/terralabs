@@ -102,9 +102,9 @@ const Dashboard = () => {
           <main className="flex-1 p-6 overflow-auto">
             <div className="max-w-5xl mx-auto">
               <div className="mb-8">
-                <h1 className="text-3xl font-bold mb-2">Create Cloud Resources</h1>
+                <h1 className="text-3xl font-bold mb-2">Create Lab</h1>
                 <p className="text-muted-foreground">
-                  Follow the steps below to provision your infrastructure using Terraform
+                  Follow the steps below to provision your lab using Terraform
                 </p>
               </div>
 
