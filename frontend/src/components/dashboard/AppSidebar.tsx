@@ -1,5 +1,5 @@
-import { useState, useEffect } from "react";
-import { Home, User, Settings, LogOut, UserCircle } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Home, Server, Settings, LogOut, User, UserCircle } from "lucide-react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
 import {
@@ -22,36 +22,68 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import axios, { AxiosHeaders } from "axios";
 
-const items = [
+type Me = {
+  id: number;
+  email: string;
+  first_name?: string | null;
+  last_name?: string | null;
+};
+
+const navItems = [
   { title: "Dashboard", url: "/dashboard", icon: Home },
+  { title: "Running Labs", url: "/labs", icon: Server },
 ];
 
 export function AppSidebar() {
   const { state } = useSidebar();
+  const isCollapsed = state === "collapsed";
   const navigate = useNavigate();
   const { toast } = useToast();
-  const [userEmail, setUserEmail] = useState<string>("");
-  const isCollapsed = state === "collapsed";
 
-  useEffect(() => {
-    const getUser = async () => {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (user) {
-        setUserEmail(user.email || "User");
-      }
-    };
-    getUser();
+  const [user, setUser] = useState<Me | null>(null);
+
+  const api = useMemo(() => {
+    const i = axios.create({
+      baseURL: "http://localhost:5000",
+      headers: new AxiosHeaders({ "Content-Type": "application/json" }),
+      timeout: 15000,
+    });
+    i.interceptors.request.use((config) => {
+      config.headers = AxiosHeaders.from(config.headers);
+      const t = localStorage.getItem("auth_token");
+      if (t) (config.headers as AxiosHeaders).set("Authorization", `Bearer ${t}`);
+      return config;
+    });
+    return i;
   }, []);
 
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const res = await api.get("/api/me");
+        if (mounted) setUser(res.data as Me);
+      } catch {
+        // Not logged in or token invalid — bounce to auth
+        navigate("/auth", { replace: true });
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [api, navigate]);
+
   const handleLogout = async () => {
-    await supabase.auth.signOut();
-    toast({
-      title: "Logged Out",
-      description: "You have been successfully logged out.",
-    });
-    navigate("/auth");
+    // Clear JWT and go to /auth
+    localStorage.removeItem("auth_token");
+    toast({ title: "Logged Out", description: "You have been successfully logged out." });
+    navigate("/auth", { replace: true });
   };
+
+  const displayName =
+    [user?.first_name, user?.last_name].filter(Boolean).join(" ") || user?.email || "User";
 
   return (
     <Sidebar collapsible="icon">
@@ -67,18 +99,18 @@ export function AppSidebar() {
                   </div>
                   <div className="flex-1 overflow-hidden text-left">
                     <p className="text-sm font-medium text-sidebar-foreground">Welcome</p>
-                    <p className="text-xs text-sidebar-foreground/70 truncate">{userEmail}</p>
+                    <p className="text-xs text-sidebar-foreground/70 truncate">{displayName}</p>
                   </div>
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="w-56">
                 <DropdownMenuLabel>My Account</DropdownMenuLabel>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem>
+                <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                   <UserCircle className="mr-2 h-4 w-4" />
                   <span>Profile</span>
                 </DropdownMenuItem>
-                <DropdownMenuItem>
+                <DropdownMenuItem onSelect={(e) => e.preventDefault()}>
                   <Settings className="mr-2 h-4 w-4" />
                   <span>Settings</span>
                 </DropdownMenuItem>
@@ -98,19 +130,20 @@ export function AppSidebar() {
           <SidebarGroupLabel>Navigation</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {items.map((item) => (
+              {navItems.map((item) => (
                 <SidebarMenuItem key={item.title}>
                   <SidebarMenuButton asChild>
                     <NavLink
                       to={item.url}
                       className={({ isActive }) =>
-                        isActive
-                          ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                          : ""
+                        [
+                          "flex items-center gap-2 rounded-md px-2 py-2 transition-colors",
+                          isActive ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent",
+                        ].join(" ")
                       }
                     >
-                      <item.icon className="h-4 w-4" />
-                      {!isCollapsed && <span>{item.title}</span>}
+                      <item.icon className="h-4 w-4 shrink-0" />
+                      {!isCollapsed && <span className="truncate">{item.title}</span>}
                     </NavLink>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

@@ -58,9 +58,13 @@ export default function WindowsSnapshotParams({
   const cleanedLab = cleanLabName(labName);
   const [derivedVmName, setDerivedVmName] = useState(`Projects-${cleanedLab}-VM`);
 
-  useEffect(() => {
-    setDerivedVmName(`Projects-${cleanLabName(labName)}-VM`);
-  }, [labName]);
+useEffect(() => {
+  const formattedCourse = course.charAt(0).toUpperCase() + course.slice(1).toLowerCase();
+  const labBase = cleanLabName(labName);
+  const formattedLab = labBase.charAt(0).toUpperCase() + labBase.slice(1);
+  setDerivedVmName(`Projects-${formattedCourse}-${formattedLab}-VM`);
+}, [course, labName]);
+
 
   // Form state
   const [vmCount, setVmCount] = useState<number>(1);

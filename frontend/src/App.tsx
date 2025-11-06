@@ -7,6 +7,7 @@ import Index from "./pages/Index";
 import AuthPage from "./components/auth/AuthPage";
 import Dashboard from "./pages/Dashboard";
 import NotFound from "./pages/NotFound";
+import RunningLabsPage from "./pages/RunningLabs";
 
 const queryClient = new QueryClient();
 
@@ -22,6 +23,7 @@ const App = () => (
           <Route path="/dashboard" element={<Dashboard />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
+          <Route path="/labs" element={<RunningLabsPage />} />
         </Routes>
       </BrowserRouter>
     </TooltipProvider>

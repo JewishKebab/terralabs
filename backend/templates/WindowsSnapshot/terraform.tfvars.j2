@@ -1,5 +1,8 @@
-# Derived VM name (strip ".tfstate" if present)
-vm_name = "Projects-{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}-VM"
+# Derived VM name (Course + Lab formatted)
+{% set course_fmt = tf_vars.course[0].upper() + tf_vars.course[1:].lower() %}
+{% set lab_raw = (lab_name.split('/')[-1] | replace('.tfstate', '')) %}
+{% set lab_fmt = lab_raw[0].upper() + lab_raw[1:] %}
+vm_name = "Projects-{{ course_fmt }}-{{ lab_fmt }}-VM"
 
 # lifecycle
 lab_id     = "{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}"

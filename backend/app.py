@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask_cors import CORS
+from flask_cors import CORS , cross_origin
 from dotenv import load_dotenv
 from functools import wraps
 from datetime import datetime, timedelta, timezone
@@ -17,18 +17,25 @@ from azure.storage.blob import (
     generate_blob_sas
 )
 
+from azure_client import list_running_labs, start_vm_by_id, stop_vm_by_id
+
+
+
 # ---------- Load env ----------
 load_dotenv()
 
 # ---------- Flask / CORS ----------
 app = Flask(__name__)
+# after app = Flask(__name__)
 CORS(
     app,
     resources={r"/api/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080"]}},
     supports_credentials=False,
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"]
+    expose_headers=["Content-Type"],
+    methods=["GET", "POST", "OPTIONS"],
 )
+
 
 # ---------- Config ----------
 app.config["SECRET_KEY"] = os.environ.get("JWT_SECRET", "fallback-secret")
@@ -56,11 +63,11 @@ db = SQLAlchemy(app)
 
 class User(db.Model):
     __tablename__ = "users"
-    id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    password = db.Column(db.String(255), nullable=False)
-    first_name = db.Column(db.String(80), nullable=True)
-    last_name = db.Column(db.String(80), nullable=True)
+    id          = db.Column(db.Integer, primary_key=True)
+    email       = db.Column(db.String(120), unique=True, nullable=False)
+    password    = db.Column(db.String(255), nullable=False)
+    first_name  = db.Column(db.String(80),  nullable=True)
+    last_name   = db.Column(db.String(80),  nullable=True)
 
 # ---------- Helpers ----------
 def make_token(user_id: int) -> str:
@@ -90,14 +97,9 @@ def get_blob_service() -> BlobServiceClient:
     return BlobServiceClient(account_url=AZURE_ACCOUNT_URL, credential=AZURE_BLOB_KEY)
 
 def _parse_iso8601_utc(s: str):
-    """
-    Accepts ISO8601 strings like '2025-11-05T17:30:00Z' or with offsets.
-    Returns an aware UTC datetime.
-    """
     if not s:
         return None
     s = s.strip()
-    # Replace trailing 'Z' with +00:00 for fromisoformat()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     try:
@@ -105,7 +107,6 @@ def _parse_iso8601_utc(s: str):
     except Exception:
         return None
     if dt.tzinfo is None:
-        # treat naive as UTC, but we prefer aware inputs
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
@@ -113,19 +114,20 @@ def _parse_iso8601_utc(s: str):
 @app.route("/api/signup", methods=["POST"])
 def signup():
     data = request.get_json(force=True) or {}
-    email = (data.get("email") or "").strip()
-    password_plain = data.get("password") or ""
-    first_name = (data.get("first_name") or "").strip()
-    last_name = (data.get("last_name") or "").strip()
+    email        = (data.get("email") or "").strip()
+    password_raw = data.get("password") or ""
+    first_name   = (data.get("first_name") or "").strip()
+    last_name    = (data.get("last_name")  or "").strip()
 
-    if not email or not password_plain or not first_name or not last_name:
+    if not email or not password_raw or not first_name or not last_name:
         return jsonify({"error": "Email, password, first_name and last_name are required"}), 400
 
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "User already exists"}), 400
 
-    hashed_password = generate_password_hash(password_plain)
-    user = User(email=email, password=hashed_password, first_name=first_name, last_name=last_name)
+    hashed = generate_password_hash(password_raw)
+    user = User(email=email, password=hashed, first_name=first_name, last_name=last_name)
+
     try:
         db.session.add(user)
         db.session.commit()
@@ -143,14 +145,14 @@ def signup():
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.get_json(force=True) or {}
-    email = (data.get("email") or "").strip()
-    password_plain = data.get("password") or ""
+    email        = (data.get("email") or "").strip()
+    password_raw = data.get("password") or ""
 
-    if not email or not password_plain:
+    if not email or not password_raw:
         return jsonify({"error": "Email and password required"}), 400
 
     user = User.query.filter_by(email=email).first()
-    if not user or not check_password_hash(user.password, password_plain):
+    if not user or not check_password_hash(user.password, password_raw):
         return jsonify({"error": "Invalid credentials"}), 401
 
     token = make_token(user.id)
@@ -180,6 +182,7 @@ def list_state_files():
     try:
         blob_service = get_blob_service()
         container_client = blob_service.get_container_client(AZURE_CONTAINER_NAME)
+
         items = []
         for blob in container_client.list_blobs():
             if not blob.name.endswith(".tfstate"):
@@ -189,6 +192,7 @@ def list_state_files():
                 "size": getattr(blob, "size", None),
                 "last_modified": blob.last_modified.isoformat() if getattr(blob, "last_modified", None) else None
             })
+
         items.sort(key=lambda x: x["last_modified"] or "", reverse=True)
         return jsonify({"states": items}), 200
     except Exception as e:
@@ -213,53 +217,138 @@ def get_state_sas_url(blob_name: str):
         print(f"[get_state_sas_url] Error: {e}")
         return jsonify({"error": "Failed to generate SAS URL"}), 500
 
-# ---------- Create lab in GitLab (supports expires_at) ----------
-@app.route("/api/labs/create", methods=["POST"])
-@token_required
+# ---------- Create lab in GitLab ----------
+@app.route("/api/labs/create", methods=["POST", "OPTIONS"])
+@cross_origin(
+    origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    methods=["POST", "OPTIONS"],
+    headers=["Content-Type", "Authorization"],
+)
 def create_lab():
+    if request.method == "OPTIONS":
+        # CORS preflight
+        return ("", 204)
+
     try:
-        data = request.get_json() or {}
-        course = data.get("course")
-        lab_name = data.get("lab_name")              # e.g. "step1.tfstate"
-        module_name = data.get("module_name")        # e.g. "WindowsSnapshot"
-        params = data.get("params", {})
-        expires_at_str = (data.get("expires_at") or "").strip()  # ISO 8601 string from UI
+        data = request.get_json(force=True) or {}
+        body_params = data.get("params") or {}
 
-        if not all([course, lab_name, module_name]):
-            return jsonify({"error": "Missing required fields: course, lab_name, module_name"}), 400
+        # accept both top-level and nested keys
+        course = (data.get("course") or body_params.get("course") or "").strip()
+        lab_name = (
+            data.get("lab_name")
+            or data.get("lab")
+            or body_params.get("lab_name")
+            or body_params.get("lab")
+            or ""
+        ).strip()
+        module_name = (data.get("module_name") or "WindowsSnapshot").strip()
 
-        # parse/validate expires_at
-        if not expires_at_str:
-            return jsonify({"error": "expires_at is required (ISO 8601)"}), 400
-        expires_at_dt = _parse_iso8601_utc(expires_at_str)
-        if not expires_at_dt:
-            return jsonify({"error": "expires_at must be ISO 8601 (e.g. 2025-11-05T18:30:00Z)"}), 400
+        # VM params (accept both locations and alternative names)
+        vm_count = int(body_params.get("vm_count") or data.get("vm_count") or 1)
+        vm_size = (body_params.get("vm_size") or data.get("vm_size") or "").strip()
+        snapshot_id = (
+            body_params.get("snapshot_id")
+            or data.get("snapshot_id")
+            or data.get("snapshot_resource_id")
+            or ""
+        ).strip()
+        data_disks = body_params.get("data_disks") or data.get("data_disks") or []
 
-        now_utc = datetime.now(timezone.utc)
-        if expires_at_dt <= now_utc:
-            return jsonify({"error": "expires_at must be in the future"}), 400
+        # lifecycle / tags
+        expires_at = data.get("expires_at") or body_params.get("expires_at")
 
-        created_at_iso = now_utc.isoformat().replace("+00:00", "Z")
-        expires_at_iso = expires_at_dt.isoformat().replace("+00:00", "Z")
+        # basic validation
+        if not course or not lab_name:
+            return jsonify({"error": "Missing course or lab name"}), 400
+        if not vm_size or not snapshot_id:
+            return jsonify({"error": "Missing vm_size or snapshot_id"}), 400
 
-        # inject lifecycle fields used by terraform templates (terraform.tfvars.j2)
-        params.update({
-            "created_at": created_at_iso,
-            "expires_at": expires_at_iso,
-        })
+        # pass exactly what the templates expect under tf_vars
+               # pass exactly what the templates expect under tf_vars
+        tf_vars = {
+            "course": course,            # << add this
+            "lab_name": lab_name,        # << and this
+            "vm_count": vm_count,
+            "vm_size": vm_size,
+            "snapshot_id": snapshot_id,
+            "data_disks": data_disks,
+            "expires_at": expires_at,    # used for tagging/cleanup
+        }
 
-        result = create_lab_in_gitlab(course, lab_name, module_name, params)
+        # create branch + files + MR in GitLab
+        result = create_lab_in_gitlab(course, lab_name, module_name, tf_vars)
 
-        return jsonify({
-            "message": f"Lab {lab_name} created",
-            "lab_folder": result.get("lab_folder"),
-            "branch": result.get("branch"),
-            "merge_request_url": result.get("merge_request_url"),
-        }), 200
+        return jsonify(result), 200
+
 
     except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        print("[/api/labs/create] Error:", e)
+        return jsonify({"error": "Failed to create lab"}), 500
+
+
+
+# ---------- NEW: Running labs (VMs + IPs) ----------
+@app.route("/api/labs/running", methods=["GET"])
+@token_required
+def labs_running():
+    try:
+        labs = list_running_labs()
+        return jsonify({"labs": labs}), 200
+    except Exception as e:
+        # Log but do not leak internals
+        print(f"[labs_running] Error: {e}")
+        return jsonify({"error": "Failed to fetch running labs"}), 500
+    
+
+@app.route("/api/vm/start", methods=["POST", "OPTIONS"])
+@cross_origin(origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+              methods=["POST", "OPTIONS"],
+              headers=["Content-Type", "Authorization"])
+def api_vm_start():
+    if request.method == "OPTIONS":
+        # Preflight
+        return ("", 204)
+    data = request.get_json(force=True) or {}
+    vm_id = data.get("vm_id")
+    if not vm_id:
+        return jsonify({"error": "vm_id required"}), 400
+    try:
+        from azure_client import start_vm_by_id
+        start_vm_by_id(vm_id)
+        return jsonify({"status": "start_requested"}), 200
+    except Exception as e:
+        print("[vm_start] Error:", e)
+        return jsonify({"error": "Failed to request start"}), 500
+
+
+@app.route("/api/vm/stop", methods=["POST", "OPTIONS"])
+@cross_origin(origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+              methods=["POST", "OPTIONS"],
+              headers=["Content-Type", "Authorization"])
+def api_vm_stop():
+    if request.method == "OPTIONS":
+        # Preflight
+        return ("", 204)
+    data = request.get_json(force=True) or {}
+    vm_id = data.get("vm_id")
+    deallocate = bool(data.get("deallocate", True))
+    if not vm_id:
+        return jsonify({"error": "vm_id required"}), 400
+    try:
+        from azure_client import stop_vm_by_id
+        stop_vm_by_id(vm_id, deallocate=deallocate)
+        return jsonify({"status": "deallocate_requested" if deallocate else "poweroff_requested"}), 200
+    except Exception as e:
+        print("[vm_stop] Error:", e)
+        return jsonify({"error": "Failed to request stop"}), 500
+
+@app.after_request
+def add_cors_headers(resp):
+    resp.headers.setdefault("Access-Control-Allow-Origin", "http://localhost:8080")
+    resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return resp
 
 # ---------- Main ----------
 if __name__ == "__main__":
