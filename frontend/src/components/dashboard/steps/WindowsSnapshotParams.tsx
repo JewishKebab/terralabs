@@ -21,6 +21,26 @@ const cleanLabName = (name: string) => {
   return last.replace(/\.tfstate$/i, "");
 };
 
+// ✅ Format "now + defaultMinutes" to local "YYYY-MM-DDTHH:mm" for <input type="datetime-local">
+const defaultLocalDateTime = (defaultMinutesAhead = 120) => {
+  const d = new Date(Date.now() + defaultMinutesAhead * 60 * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  const mm = pad(d.getMonth() + 1);
+  const dd = pad(d.getDate());
+  const hh = pad(d.getHours());
+  const min = pad(d.getMinutes());
+  return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
+};
+
+// ✅ Convert local datetime-local value to UTC ISO string (ends with Z)
+const localToUtcIso = (local: string): string | null => {
+  if (!local) return null;
+  const d = new Date(local);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString();
+};
+
 export default function WindowsSnapshotParams({
   course,
   labName,
@@ -35,18 +55,21 @@ export default function WindowsSnapshotParams({
   const { toast } = useToast();
   const [loading, setLoading] = useState(false);
 
-  const cleanedLabName = cleanLabName(labName);
-  const [derivedVmName, setDerivedVmName] = useState(`Projects-${cleanedLabName}-VM`);
+  const cleanedLab = cleanLabName(labName);
+  const [derivedVmName, setDerivedVmName] = useState(`Projects-${cleanedLab}-VM`);
 
   useEffect(() => {
     setDerivedVmName(`Projects-${cleanLabName(labName)}-VM`);
   }, [labName]);
 
-  // State for other fields
+  // Form state
   const [vmCount, setVmCount] = useState<number>(1);
   const [vmSize, setVmSize] = useState("Standard_D2s_v5");
   const [snapshotId, setSnapshotId] = useState("");
   const [disks, setDisks] = useState<Disk[]>([]);
+
+  // New: expiry (default 2 hours from now)
+  const [expiresLocal, setExpiresLocal] = useState<string>(defaultLocalDateTime(120));
 
   const api = useMemo(() => {
     const i = axios.create({
@@ -83,12 +106,31 @@ export default function WindowsSnapshotParams({
       return;
     }
 
+    const expiresIso = localToUtcIso(expiresLocal);
+    if (!expiresIso) {
+      toast({
+        variant: "destructive",
+        title: "Invalid expiry",
+        description: "Please pick a valid expiry date/time.",
+      });
+      return;
+    }
+    if (new Date(expiresIso).getTime() <= Date.now()) {
+      toast({
+        variant: "destructive",
+        title: "Expiry must be in the future",
+        description: "Choose a later date/time.",
+      });
+      return;
+    }
+
     setLoading(true);
     try {
       const payload = {
         course,
-        lab_name: labName, // still the full name with .tfstate (needed for backend)
+        lab_name: labName, // keep the full name with .tfstate for backend/backend.tf
         module_name: "WindowsSnapshot",
+        expires_at: expiresIso, // 👈 send top-level expires_at (UTC ISO)
         params: {
           vm_count: vmCount,
           vm_size: vmSize,
@@ -97,26 +139,25 @@ export default function WindowsSnapshotParams({
         },
       };
 
-        const res = await api.post("/api/labs/create", payload);
+      const res = await api.post("/api/labs/create", payload);
 
-        toast({
+      toast({
         title: "Terraform Lab Created",
         description: res?.data?.merge_request_url ? (
-            <a
+          <a
             href={res.data.merge_request_url}
             target="_blank"
             rel="noopener noreferrer"
             className="text-primary underline"
-            >
+          >
             View Merge Request in GitLab
-            </a>
+          </a>
         ) : (
-            "Merge request created in GitLab."
+          "Merge request created in GitLab."
         ),
-        });
+      });
 
-        onDone(res.data);
-
+      onDone(res.data);
     } catch (err: any) {
       const msg = err?.response?.data?.error || err?.message || "Failed to create lab.";
       toast({ variant: "destructive", title: "Error", description: msg });
@@ -127,14 +168,14 @@ export default function WindowsSnapshotParams({
 
   return (
     <div className="space-y-6">
-      {/* 🧠 Header Info */}
+      {/* Header Info */}
       <Card className="p-4">
         <div className="text-sm text-muted-foreground">
           <div>
             <span className="font-medium text-foreground">Course:</span> {course}
           </div>
           <div>
-            <span className="font-medium text-foreground">Lab:</span> {cleanedLabName}
+            <span className="font-medium text-foreground">Lab:</span> {cleanedLab}
           </div>
           <div>
             <span className="font-medium text-foreground">Module:</span> Snapshot Virtual Machine
@@ -148,8 +189,8 @@ export default function WindowsSnapshotParams({
         <Input value={derivedVmName} readOnly />
       </div>
 
-      {/* Remaining form as before */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* VM Count */}
         <div className="space-y-2">
           <Label>VM Count *</Label>
           <Input
@@ -160,6 +201,7 @@ export default function WindowsSnapshotParams({
           />
         </div>
 
+        {/* VM Size */}
         <div className="space-y-2">
           <Label>VM Size *</Label>
           <Select value={vmSize} onValueChange={setVmSize}>
@@ -173,6 +215,7 @@ export default function WindowsSnapshotParams({
           </Select>
         </div>
 
+        {/* Snapshot ID */}
         <div className="md:col-span-2 space-y-2">
           <Label>OS Snapshot Resource ID *</Label>
           <Input
@@ -180,6 +223,20 @@ export default function WindowsSnapshotParams({
             value={snapshotId}
             onChange={(e) => setSnapshotId(e.target.value)}
           />
+        </div>
+
+        {/* Expiry */}
+        <div className="md:col-span-2 space-y-2">
+          <Label>Expires At *</Label>
+          <Input
+            type="datetime-local"
+            value={expiresLocal}
+            onChange={(e) => setExpiresLocal(e.target.value)}
+            min={defaultLocalDateTime(1)} // prevent past selection
+          />
+          <p className="text-xs text-muted-foreground">
+            Pick the date & time this lab should expire (your local time). It will be stored in UTC.
+          </p>
         </div>
       </div>
 
@@ -198,7 +255,7 @@ export default function WindowsSnapshotParams({
           <div className="space-y-3">
             {disks.map((d, i) => (
               <Card key={i} className="p-3">
-                <div className="grid grid-cols-1 sm:grid-cols-5 gap-2">
+                <div className="grid grid-cols-1 sm-grid-cols-5 md:grid-cols-5 gap-2">
                   <div className="space-y-1">
                     <Label>Name</Label>
                     <Input value={d.name} onChange={(e) => updateDisk(i, { name: e.target.value })} />
@@ -229,9 +286,7 @@ export default function WindowsSnapshotParams({
                       type="number"
                       min={1}
                       value={d.disk_size_gb}
-                      onChange={(e) =>
-                        updateDisk(i, { disk_size_gb: Number(e.target.value || 0) })
-                      }
+                      onChange={(e) => updateDisk(i, { disk_size_gb: Number(e.target.value || 0) })}
                     />
                   </div>
                   <div className="flex items-end">

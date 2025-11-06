@@ -39,3 +39,24 @@ variable "data_disks" {
   }))
   default = []
 }
+
+
+variable "lab_id" {
+  type        = string
+  description = "Short lab identifier (e.g. step1)"
+}
+
+variable "created_at" {
+  type        = string
+  description = "ISO8601 UTC when the lab was created"
+}
+
+variable "expires_at" {
+  type        = string
+  description = "ISO8601 UTC when the lab should expire"
+}
+
+variable "course" {
+  type        = string
+  description = "The course this lab belongs to (e.g. devops, cloudfundamentals)"
+}

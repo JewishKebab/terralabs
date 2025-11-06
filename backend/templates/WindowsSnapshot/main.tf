@@ -24,9 +24,15 @@ module "VMs" {
   resource_group_name = data.azurerm_resource_group.terralabs-rg.name
   vm_name = var.vm_name
   data_disks = var.data_disks
-  os_snapshot_id = var.snapshot_id
+  os_snapshot_id = var.os_snapshot_id
   providers = {
   azurerm = azurerm.Projects
   }
   computer_name = ""
+  extra_tags = {
+    LabId      = var.lab_id
+    CreatedAt  = var.created_at
+    ExpiresAt  = var.expires_at
+    LabCourse  = var.course   
+  }
 }

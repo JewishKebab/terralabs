@@ -1,11 +1,16 @@
-# backend/templates/WindowsSnapshot/terraform.tfvars.j2
-
 # Derived VM name (strip ".tfstate" if present)
 vm_name = "Projects-{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}-VM"
 
+# lifecycle
+lab_id     = "{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}"
+created_at = "{{ tf_vars.created_at }}"
+expires_at = "{{ tf_vars.expires_at }}"
+course     = "{{ course }}"
+
+# module params
 vm_count    = {{ tf_vars.vm_count }}
 vm_size     = "{{ tf_vars.vm_size }}"
-snapshot_id = "{{ tf_vars.snapshot_id }}"
+os_snapshot_id = "{{ tf_vars.snapshot_id }}"
 
 data_disks = [
 {% if tf_vars.data_disks and tf_vars.data_disks|length > 0 -%}

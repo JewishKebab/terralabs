@@ -4,17 +4,17 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from flask_cors import CORS
 from dotenv import load_dotenv
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import jwt, os
 
-# 👇 make sure the file is named gitlab_utils.py (no dash)
+# GitLab helpers
 from gitlab_utils import MODULE_SCHEMAS, create_lab_in_gitlab
 
 # Azure Blob
 from azure.storage.blob import (
     BlobServiceClient,
     BlobSasPermissions,
-    generate_blob_sas,
+    generate_blob_sas
 )
 
 # ---------- Load env ----------
@@ -27,7 +27,7 @@ CORS(
     resources={r"/api/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080"]}},
     supports_credentials=False,
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"],
+    methods=["GET", "POST", "OPTIONS"]
 )
 
 # ---------- Config ----------
@@ -45,10 +45,10 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
 AZURE_BLOB_KEY = os.environ.get("AZURE_BLOB_KEY")
 AZURE_CONTAINER_NAME = os.environ.get("AZURE_CONTAINER_NAME")
+
 if not (AZURE_STORAGE_ACCOUNT_NAME and AZURE_BLOB_KEY and AZURE_CONTAINER_NAME):
-    raise RuntimeError(
-        "Missing Azure Storage env vars: AZURE_STORAGE_ACCOUNT_NAME, AZURE_BLOB_KEY, AZURE_CONTAINER_NAME"
-    )
+    raise RuntimeError("Missing Azure Storage env vars: AZURE_STORAGE_ACCOUNT_NAME, AZURE_BLOB_KEY, AZURE_CONTAINER_NAME")
+
 AZURE_ACCOUNT_URL = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
 
 # ---------- DB ----------
@@ -65,7 +65,7 @@ class User(db.Model):
 # ---------- Helpers ----------
 def make_token(user_id: int) -> str:
     return jwt.encode(
-        {"user_id": user_id, "exp": datetime.utcnow() + timedelta(hours=24)},
+        {"user_id": user_id, "exp": datetime.now(timezone.utc) + timedelta(hours=24)},
         app.config["SECRET_KEY"],
         algorithm="HS256",
     )
@@ -89,7 +89,27 @@ def token_required(fn):
 def get_blob_service() -> BlobServiceClient:
     return BlobServiceClient(account_url=AZURE_ACCOUNT_URL, credential=AZURE_BLOB_KEY)
 
-# ---------- Auth Routes ----------
+def _parse_iso8601_utc(s: str):
+    """
+    Accepts ISO8601 strings like '2025-11-05T17:30:00Z' or with offsets.
+    Returns an aware UTC datetime.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    # Replace trailing 'Z' with +00:00 for fromisoformat()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        # treat naive as UTC, but we prefer aware inputs
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+# ---------- Auth ----------
 @app.route("/api/signup", methods=["POST"])
 def signup():
     data = request.get_json(force=True) or {}
@@ -105,8 +125,7 @@ def signup():
         return jsonify({"error": "User already exists"}), 400
 
     hashed_password = generate_password_hash(password_plain)
-    user = User(email=email, password=hashed_password,
-                first_name=first_name, last_name=last_name)
+    user = User(email=email, password=hashed_password, first_name=first_name, last_name=last_name)
     try:
         db.session.add(user)
         db.session.commit()
@@ -118,8 +137,7 @@ def signup():
     return jsonify({
         "token": token,
         "redirect_url": "/dashboard",
-        "user": {"id": user.id, "email": user.email,
-                 "first_name": user.first_name, "last_name": user.last_name}
+        "user": {"id": user.id, "email": user.email, "first_name": user.first_name, "last_name": user.last_name}
     }), 200
 
 @app.route("/api/login", methods=["POST"])
@@ -138,55 +156,7 @@ def login():
     token = make_token(user.id)
     return jsonify({"token": token, "redirect_url": "/dashboard"}), 200
 
-# ---------- Azure Blob Routes ----------
-@app.route("/api/states", methods=["GET"])
-@token_required
-def list_state_files():
-    try:
-        blob_service = get_blob_service()
-        container_client = blob_service.get_container_client(AZURE_CONTAINER_NAME)
-
-        items = []
-        for blob in container_client.list_blobs():
-            if not blob.name.endswith(".tfstate"):
-                continue
-            items.append({
-                "name": blob.name,
-                "size": getattr(blob, "size", None),
-                "last_modified": blob.last_modified.isoformat() if getattr(blob, "last_modified", None) else None
-            })
-
-        items.sort(key=lambda x: x["last_modified"] or "", reverse=True)
-        return jsonify({"states": items}), 200
-    except Exception as e:
-        print(f"[list_state_files] Error: {e}")
-        return jsonify({"error": "Failed to list state files"}), 500
-
-@app.route("/api/states/<path:blob_name>/url", methods=["GET"])
-@token_required
-def get_state_sas_url(blob_name: str):
-    try:
-        sas_token = generate_blob_sas(
-            account_name=AZURE_STORAGE_ACCOUNT_NAME,
-            container_name=AZURE_CONTAINER_NAME,
-            blob_name=blob_name,
-            account_key=AZURE_BLOB_KEY,
-            permission=BlobSasPermissions(read=True),
-            expiry=datetime.utcnow() + timedelta(minutes=10),
-        )
-        url = f"{AZURE_ACCOUNT_URL}/{AZURE_CONTAINER_NAME}/{blob_name}?{sas_token}"
-        return jsonify({"url": url, "expires_in_minutes": 10}), 200
-    except Exception as e:
-        print(f"[get_state_sas_url] Error: {e}")
-        return jsonify({"error": "Failed to generate SAS URL"}), 500
-
-# ---------- Protected smoke test ----------
-@app.route("/api/protected", methods=["GET"])
-@token_required
-def protected():
-    return jsonify({"ok": True}), 200
-
-# ---------- Get info about user ----------
+# ---------- User info ----------
 @app.route("/api/me", methods=["GET"])
 @token_required
 def me():
@@ -203,46 +173,92 @@ def me():
         "last_name": user.last_name
     }), 200
 
-# ---------- Modules & Lab creation (GitLab) ----------
-@app.route("/api/modules", methods=["GET"])
+# ---------- Azure Blob (states) ----------
+@app.route("/api/states", methods=["GET"])
 @token_required
-def list_modules():
-    modules = [{"name": k, "title": v["title"]} for k, v in MODULE_SCHEMAS.items()]
-    return jsonify({"modules": modules}), 200
+def list_state_files():
+    try:
+        blob_service = get_blob_service()
+        container_client = blob_service.get_container_client(AZURE_CONTAINER_NAME)
+        items = []
+        for blob in container_client.list_blobs():
+            if not blob.name.endswith(".tfstate"):
+                continue
+            items.append({
+                "name": blob.name,
+                "size": getattr(blob, "size", None),
+                "last_modified": blob.last_modified.isoformat() if getattr(blob, "last_modified", None) else None
+            })
+        items.sort(key=lambda x: x["last_modified"] or "", reverse=True)
+        return jsonify({"states": items}), 200
+    except Exception as e:
+        print(f"[list_state_files] Error: {e}")
+        return jsonify({"error": "Failed to list state files"}), 500
 
-@app.route("/api/modules/<name>/schema", methods=["GET"])
+@app.route("/api/states/<path:blob_name>/url", methods=["GET"])
 @token_required
-def get_module_schema(name):
-    schema = MODULE_SCHEMAS.get(name)
-    if not schema:
-        return jsonify({"error": "Unknown module"}), 404
-    return jsonify(schema), 200
+def get_state_sas_url(blob_name: str):
+    try:
+        sas_token = generate_blob_sas(
+            account_name=AZURE_STORAGE_ACCOUNT_NAME,
+            container_name=AZURE_CONTAINER_NAME,
+            blob_name=blob_name,
+            account_key=AZURE_BLOB_KEY,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.now(timezone.utc) + timedelta(minutes=10)
+        )
+        url = f"{AZURE_ACCOUNT_URL}/{AZURE_CONTAINER_NAME}/{blob_name}?{sas_token}"
+        return jsonify({"url": url, "expires_in_minutes": 10}), 200
+    except Exception as e:
+        print(f"[get_state_sas_url] Error: {e}")
+        return jsonify({"error": "Failed to generate SAS URL"}), 500
 
+# ---------- Create lab in GitLab (supports expires_at) ----------
 @app.route("/api/labs/create", methods=["POST"])
+@token_required
 def create_lab():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         course = data.get("course")
-        lab_name = data.get("lab_name")
-        module_name = data.get("module_name")
+        lab_name = data.get("lab_name")              # e.g. "step1.tfstate"
+        module_name = data.get("module_name")        # e.g. "WindowsSnapshot"
         params = data.get("params", {})
+        expires_at_str = (data.get("expires_at") or "").strip()  # ISO 8601 string from UI
 
         if not all([course, lab_name, module_name]):
-            return jsonify({"error": "Missing required fields"}), 400
+            return jsonify({"error": "Missing required fields: course, lab_name, module_name"}), 400
 
-        # Call your GitLab function (creates new branch + MR)
+        # parse/validate expires_at
+        if not expires_at_str:
+            return jsonify({"error": "expires_at is required (ISO 8601)"}), 400
+        expires_at_dt = _parse_iso8601_utc(expires_at_str)
+        if not expires_at_dt:
+            return jsonify({"error": "expires_at must be ISO 8601 (e.g. 2025-11-05T18:30:00Z)"}), 400
+
+        now_utc = datetime.now(timezone.utc)
+        if expires_at_dt <= now_utc:
+            return jsonify({"error": "expires_at must be in the future"}), 400
+
+        created_at_iso = now_utc.isoformat().replace("+00:00", "Z")
+        expires_at_iso = expires_at_dt.isoformat().replace("+00:00", "Z")
+
+        # inject lifecycle fields used by terraform templates (terraform.tfvars.j2)
+        params.update({
+            "created_at": created_at_iso,
+            "expires_at": expires_at_iso,
+        })
+
         result = create_lab_in_gitlab(course, lab_name, module_name, params)
 
         return jsonify({
-            "message": f"Lab {lab_name} created successfully",
-            "lab_folder": result["lab_folder"],
-            "branch": result["branch"],
-            "merge_request_url": result["merge_request_url"]
+            "message": f"Lab {lab_name} created",
+            "lab_folder": result.get("lab_folder"),
+            "branch": result.get("branch"),
+            "merge_request_url": result.get("merge_request_url"),
         }), 200
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        import traceback; traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 # ---------- Main ----------
