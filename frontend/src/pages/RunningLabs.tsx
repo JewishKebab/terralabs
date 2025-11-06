@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import axios, { AxiosHeaders } from "axios";
-import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarProvider } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/dashboard/AppSidebar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Input } from "@/components/ui/input";
 import {
   Table,
   TableHeader,
@@ -14,10 +13,8 @@ import {
   TableHead,
   TableCell,
 } from "@/components/ui/table";
-import { Skeleton } from "@/components/ui/skeleton";
-import { useToast } from "@/hooks/use-toast";
-import { RefreshCw, Server, HardDrive, Network, Clock } from "lucide-react";
-import logo from "@/assets/terralabs-logo.png";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectTrigger,
@@ -25,6 +22,28 @@ import {
   SelectItem,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import { Switch } from "@/components/ui/switch";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useToast } from "@/hooks/use-toast";
+import {
+  RefreshCw,
+  Server,
+  HardDrive,
+  Network,
+  Clock,
+  Trash2,
+  Play,
+  Square,
+} from "lucide-react";
+import logo from "@/assets/terralabs-logo.png";
 
 type Vm = {
   id: string;
@@ -49,12 +68,18 @@ export default function RunningLabsPage() {
   const [loading, setLoading] = useState(true);
   const [labs, setLabs] = useState<Lab[]>([]);
 
-  // global filters
-  const [globalLabQuery, setGlobalLabQuery] = useState("");
-  const [courseFilter, setCourseFilter] = useState<string>("all");
+  // Filters
+  const [qLab, setQLab] = useState("");
+  const [qIp, setQIp] = useState("");
+  const [courseFilter, setCourseFilter] = useState<string>("__all__");
 
-  // per-lab VM private IP query
-  const [vmSearch, setVmSearch] = useState<Record<string, string>>({}); // key: `${course}:${lab_id}`
+  // Delete dialog
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteWorking, setDeleteWorking] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<Lab | null>(null);
+  const [optDestroy, setOptDestroy] = useState(true);
+  const [optWait, setOptWait] = useState(false);
+  const [optDeleteState, setOptDeleteState] = useState(false);
 
   const api = useMemo(() => {
     const i = axios.create({
@@ -80,7 +105,7 @@ export default function RunningLabsPage() {
       toast({
         variant: "destructive",
         title: "Failed to load labs",
-        description: err?.response?.data?.error || err?.message || "Failed to fetch running labs",
+        description: err?.response?.data?.error || err?.message || "Unexpected error.",
       });
     } finally {
       setLoading(false);
@@ -91,46 +116,92 @@ export default function RunningLabsPage() {
     fetchLabs();
   }, []); // eslint-disable-line
 
-  const courses = useMemo(() => {
-    const set = new Set<string>();
-    labs.forEach((l) => set.add(l.course || ""));
-    return Array.from(set).sort();
-  }, [labs]);
-
-  // power controls
-  const requestAction = async (
-    kind: "start" | "stop",
-    vmId: string,
-    opts?: { deallocate?: boolean }
-  ) => {
+  // Power controls
+  const powerStart = async (vm: Vm) => {
     try {
-      const url =
-        kind === "start" ? "/api/vm/start" : "/api/vm/stop";
-      await api.post(url, { vm_id: vmId, deallocate: opts?.deallocate ?? true });
-      toast({
-        title: kind === "start" ? "Start requested" : "Stop requested",
-        description: "Azure will process the request shortly.",
-      });
-      // brief refresh
-      setTimeout(fetchLabs, 1500);
-    } catch (err: any) {
+      await api.post("/api/vm/start", { vm_id: vm.id });
+      toast({ title: "Start requested", description: vm.name });
+      fetchLabs();
+    } catch (e: any) {
       toast({
         variant: "destructive",
-        title: "Action failed",
-        description: err?.response?.data?.error || err?.message || "Unexpected error.",
+        title: "Failed to start VM",
+        description: e?.response?.data?.error || e?.message,
       });
     }
   };
 
-  // filtered labs by global toolbar
-  const filteredLabs = useMemo(() => {
-    const q = globalLabQuery.trim().toLowerCase();
-    return labs.filter((lab) => {
-      const matchesCourse = courseFilter === "all" || lab.course === courseFilter;
-      const matchesLab = !q || lab.lab_id.toLowerCase().includes(q);
-      return matchesCourse && matchesLab;
-    });
-  }, [labs, globalLabQuery, courseFilter]);
+  const powerStop = async (vm: Vm) => {
+    try {
+      await api.post("/api/vm/stop", { vm_id: vm.id, deallocate: true });
+      toast({ title: "Stop (deallocate) requested", description: vm.name });
+      fetchLabs();
+    } catch (e: any) {
+      toast({
+        variant: "destructive",
+        title: "Failed to stop VM",
+        description: e?.response?.data?.error || e?.message,
+      });
+    }
+  };
+
+  // Delete flow
+  const openDelete = (lab: Lab) => {
+    setDeleteTarget(lab);
+    setOptDestroy(true);
+    setOptWait(false);
+    setOptDeleteState(false);
+    setDeleteOpen(true);
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleteWorking(true);
+    try {
+      const body = {
+        course: deleteTarget.course,
+        lab_id: deleteTarget.lab_id,
+        destroy: optDestroy,
+        wait_for_destroy: optWait,
+        delete_state: optDeleteState,
+      };
+      const res = await api.post("/api/labs/delete", body);
+
+      toast({
+        title: "Delete requested",
+        description: res?.data?.delete_mr?.merge_request_url
+          ? "MR opened to remove lab files."
+          : "Request submitted.",
+      });
+
+      setDeleteOpen(false);
+      setDeleteTarget(null);
+      fetchLabs();
+    } catch (e: any) {
+      toast({
+        variant: "destructive",
+        title: "Failed to request deletion",
+        description: e?.response?.data?.error || e?.message,
+      });
+    } finally {
+      setDeleteWorking(false);
+    }
+  };
+
+  // Filters
+  const courseOptions = Array.from(new Set(labs.map((l) => l.course))).sort();
+  const filtered = labs.filter((lab) => {
+    const byLab = qLab ? lab.lab_id.toLowerCase().includes(qLab.toLowerCase()) : true;
+    const byCourse = courseFilter === "__all__" ? true : lab.course === courseFilter;
+    const byIp = qIp
+      ? lab.vms.some(
+          (v) =>
+            (v.private_ip || "").includes(qIp) ||
+            (v.public_ip || "").includes(qIp)
+        )
+      : true;
+    return byLab && byCourse && byIp;
+  });
 
   return (
     <SidebarProvider>
@@ -138,10 +209,9 @@ export default function RunningLabsPage() {
         <AppSidebar />
 
         <div className="flex-1 flex flex-col">
-          {/* Header (same as Dashboard look) */}
+          {/* Header */}
           <header className="h-16 border-b bg-card flex items-center justify-between px-6 shadow-sm">
             <div className="flex items-center gap-4">
-              <SidebarTrigger />
               <div className="py-2 rounded-md">
                 <img src={logo} alt="TerraLabs" className="h-10" />
               </div>
@@ -155,57 +225,47 @@ export default function RunningLabsPage() {
             </div>
           </header>
 
+          {/* Filters */}
+          <div className="px-6 pt-4 max-w-6xl mx-auto w-full">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <Label>Search Lab</Label>
+                <Input
+                  placeholder="e.g. step1"
+                  value={qLab}
+                  onChange={(e) => setQLab(e.target.value)}
+                />
+              </div>
+              <div>
+                <Label>Filter by Course</Label>
+                <Select value={courseFilter} onValueChange={setCourseFilter}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="All courses" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__all__">All courses</SelectItem>
+                    {courseOptions.map((c) => (
+                      <SelectItem key={c} value={c}>
+                        {c}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div>
+                <Label>Search VM Private IP</Label>
+                <Input
+                  placeholder="e.g. 10.98.0.4"
+                  value={qIp}
+                  onChange={(e) => setQIp(e.target.value)}
+                />
+              </div>
+            </div>
+          </div>
+
           {/* Content */}
           <main className="flex-1 p-6 overflow-auto">
             <div className="max-w-6xl mx-auto space-y-6">
-
-              {/* Global toolbar */}
-              <Card className="shadow-elegant">
-                <CardContent className="py-4">
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <div className="space-y-1">
-                      <div className="text-xs text-muted-foreground">Search Lab</div>
-                      <Input
-                        placeholder="e.g. step1"
-                        value={globalLabQuery}
-                        onChange={(e) => setGlobalLabQuery(e.target.value)}
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <div className="text-xs text-muted-foreground">Filter by Course</div>
-                      <Select
-                        value={courseFilter}
-                        onValueChange={(v) => setCourseFilter(v)}
-                      >
-                        <SelectTrigger>
-                          <SelectValue placeholder="All courses" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="all">All courses</SelectItem>
-                          {courses.map((c) => (
-                            <SelectItem key={c || "none"} value={c || ""}>
-                              {c || "(none)"}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="flex items-end">
-                      <Button
-                        variant="secondary"
-                        className="w-full md:w-auto"
-                        onClick={() => {
-                          setGlobalLabQuery("");
-                          setCourseFilter("all");
-                        }}
-                      >
-                        Clear
-                      </Button>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-
               {loading ? (
                 <Card>
                   <CardHeader>
@@ -221,166 +281,206 @@ export default function RunningLabsPage() {
                     <Skeleton className="h-10 w-full" />
                   </CardContent>
                 </Card>
-              ) : filteredLabs.length === 0 ? (
+              ) : filtered.length === 0 ? (
                 <Card className="shadow-elegant">
                   <CardHeader>
-                    <CardTitle>No running labs found.</CardTitle>
+                    <CardTitle>No running labs found</CardTitle>
                   </CardHeader>
                   <CardContent className="text-sm text-muted-foreground">
                     Once your pipelines finish and VMs are up, they’ll appear here.
                   </CardContent>
                 </Card>
               ) : (
-                filteredLabs.map((lab) => {
-                  const key = `${lab.course}:${lab.lab_id}`;
-                  const privateIpQuery = (vmSearch[key] || "").trim();
+                filtered.map((lab) => (
+                  <Card
+                    key={`${lab.course}:${lab.lab_id}`}
+                    className="shadow-elegant"
+                  >
+                    <CardHeader>
+                      <div className="flex items-center justify-between">
+                        <CardTitle className="flex items-center gap-2">
+                          <Server className="h-5 w-5" />
+                          <span className="font-semibold">{lab.lab_id}</span>
+                          <Badge variant="secondary">{lab.course}</Badge>
+                        </CardTitle>
 
-                  const vms = privateIpQuery
-                    ? lab.vms.filter((v) =>
-                        (v.private_ip || "")
-                          .toLowerCase()
-                          .includes(privateIpQuery.toLowerCase())
-                      )
-                    : lab.vms;
-
-                  return (
-                    <Card key={key} className="shadow-elegant">
-                      <CardHeader>
-                        <div className="flex items-center justify-between gap-4">
-                          <CardTitle className="flex items-center gap-2">
-                            <Server className="h-5 w-5" />
-                            <span className="font-semibold">{lab.lab_id}</span>
-                            <Badge variant="secondary" className="uppercase">
-                              {lab.course || "unknown"}
-                            </Badge>
-                          </CardTitle>
-
-                          <div className="flex-1" />
-
-                          <div className="hidden md:flex items-center gap-6 text-sm text-muted-foreground mr-5">
-                            {lab.created_at && (
-                              <span className="inline-flex items-center gap-1">
-                                <Clock className="h-4 w-4" />{" "}
-                                Created: {new Date(lab.created_at).toLocaleString()}
-                              </span>
-                            )}
-                            {lab.expires_at && (
-                              <span className="inline-flex items-center gap-1">
-                                <Clock className="h-4 w-4" />{" "}
-                                Expires: {new Date(lab.expires_at).toLocaleString()}
-                              </span>
-                            )}
-                          </div>
-
-                          {/* Per-lab VM Private IP search */}
-                          <div className="w-full md:w-64 mb-4">
-                            <div className="text-xs text-muted-foreground mb-1">
-                              Search VM Private IP
-                            </div>
-                            <Input
-                              placeholder="e.g. 10.98.0.4"
-                              value={privateIpQuery}
-                              onChange={(e) =>
-                                setVmSearch((s) => ({ ...s, [key]: e.target.value }))
-                              }
-                            />
-                          </div>
+                        <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                          {lab.created_at && (
+                            <span className="inline-flex items-center gap-1">
+                              <Clock className="h-4 w-4" /> Created:{" "}
+                              {new Date(lab.created_at).toLocaleString()}
+                            </span>
+                          )}
+                          {lab.expires_at && (
+                            <span className="inline-flex items-center gap-1">
+                              <Clock className="h-4 w-4" /> Expires:{" "}
+                              {new Date(lab.expires_at).toLocaleString()}
+                            </span>
+                          )}
+                          <Button
+                            variant="destructive"
+                            size="sm"
+                            onClick={() => openDelete(lab)}
+                          >
+                            <Trash2 className="h-4 w-4 mr-2" />
+                            Delete Lab
+                          </Button>
                         </div>
-                      </CardHeader>
+                      </div>
+                    </CardHeader>
 
-                      <CardContent>
-                        {vms.length === 0 ? (
-                          <p className="text-sm text-muted-foreground">
-                            No VMs match this filter.
-                          </p>
-                        ) : (
-                          <div className="overflow-x-auto rounded-md border">
-                            <Table className="min-w-[820px]">
-                              <TableHeader>
-                                <TableRow>
-                                  <TableHead className="w-1/3">Name</TableHead>
-                                  <TableHead className="w-1/6">Size</TableHead>
-                                  <TableHead className="w-1/6">Private IP</TableHead>
-                                  <TableHead className="w-1/6">Power</TableHead>
-                                  <TableHead className="w-1/6 text-center">Actions</TableHead>
-                                </TableRow>
-                              </TableHeader>
-                              <TableBody>
-                                {vms.map((vm) => (
-                                  <TableRow key={vm.id}>
-                                    <TableCell className="font-medium">
-                                      <div className="flex items-center gap-2">
-                                        <HardDrive className="h-4 w-4" />
-                                        {vm.name}
-                                      </div>
-                                    </TableCell>
-
-                                    <TableCell>{vm.size || "-"}</TableCell>
-
-                                    <TableCell>
-                                      <div className="inline-flex items-center gap-2">
-                                        <Network className="h-4 w-4" />
-                                        {vm.private_ip || "-"}
-                                      </div>
-                                    </TableCell>
-
-                                    <TableCell>
-                                      <Badge
-                                        variant={
-                                          vm.power_state === "running"
-                                            ? "default"
-                                            : "secondary"
-                                        }
-                                        className={
-                                          vm.power_state === "running"
-                                            ? "bg-violet-600"
-                                            : ""
-                                        }
+                    <CardContent>
+                      {lab.vms.length === 0 ? (
+                        <p className="text-sm text-muted-foreground">
+                          No VMs discovered for this lab.
+                        </p>
+                      ) : (
+                        <div className="overflow-x-auto rounded-md border">
+                          <Table className="min-w-[720px]">
+                            <TableHeader>
+                              <TableRow>
+                                <TableHead className="w-1/4">Name</TableHead>
+                                <TableHead className="w-1/6">Size</TableHead>
+                                <TableHead className="w-1/6">Private IP</TableHead>
+                                <TableHead className="w-1/6">Power</TableHead>
+                                <TableHead className="w-1/6 text-center">
+                                  Actions
+                                </TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              {lab.vms.map((vm) => (
+                                <TableRow key={vm.id}>
+                                  <TableCell className="font-medium">
+                                    <div className="flex items-center gap-2">
+                                      <HardDrive className="h-4 w-4" />
+                                      {vm.name}
+                                    </div>
+                                  </TableCell>
+                                  <TableCell>{vm.size || "-"}</TableCell>
+                                  <TableCell>
+                                    <div className="inline-flex items-center gap-2">
+                                      <Network className="h-4 w-4" />
+                                      {vm.private_ip || "-"}
+                                    </div>
+                                  </TableCell>
+                                  <TableCell>
+                                    <Badge variant="outline">
+                                      {(vm.power_state || "").toUpperCase() || "-"}
+                                    </Badge>
+                                  </TableCell>
+                                  <TableCell className="text-center">
+                                    <div className="inline-flex gap-2">
+                                      <Button
+                                        variant="secondary"
+                                        size="sm"
+                                        onClick={() => powerStart(vm)}
                                       >
-                                        {(vm.power_state || "-").toUpperCase()}
-                                      </Badge>
-                                    </TableCell>
-
-                                    {/* Centered actions */}
-                                    <TableCell className="text-center">
-                                      <div className="flex items-center justify-center gap-2">
-                                        {vm.power_state === "running" ? (
-                                          <Button
-                                            variant="destructive"
-                                            size="sm"
-                                            onClick={() =>
-                                              requestAction("stop", vm.id, {
-                                                deallocate: true,
-                                              })
-                                            }
-                                          >
-                                            Stop
-                                          </Button>
-                                        ) : (
-                                          <Button
-                                            size="sm"
-                                            onClick={() => requestAction("start", vm.id)}
-                                          >
-                                            Start
-                                          </Button>
-                                        )}
-                                      </div>
-                                    </TableCell>
-                                  </TableRow>
-                                ))}
-                              </TableBody>
-                            </Table>
-                          </div>
-                        )}
-                      </CardContent>
-                    </Card>
-                  );
-                })
+                                        <Play className="h-4 w-4 mr-1" /> Start
+                                      </Button>
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() => powerStop(vm)}
+                                      >
+                                        <Square className="h-4 w-4 mr-1" /> Stop
+                                      </Button>
+                                    </div>
+                                  </TableCell>
+                                </TableRow>
+                              ))}
+                            </TableBody>
+                          </Table>
+                        </div>
+                      )}
+                    </CardContent>
+                  </Card>
+                ))
               )}
             </div>
           </main>
         </div>
       </div>
+
+      {/* Delete dialog */}
+      <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete Lab</DialogTitle>
+            <DialogDescription>
+              This will (optionally) destroy all VMs and open a Merge Request to
+              remove the lab files from GitLab.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            <div className="text-sm">
+              <div>
+                <span className="font-medium">Course:</span> {deleteTarget?.course}
+              </div>
+              <div>
+                <span className="font-medium">Lab:</span> {deleteTarget?.lab_id}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label>Destroy resources first</Label>
+                <p className="text-xs text-muted-foreground">
+                  Triggers the CI with TF_ACTION=destroy before deleting lab
+                  files.
+                </p>
+              </div>
+              <Switch checked={optDestroy} onCheckedChange={setOptDestroy} />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label>Wait for destroy to finish</Label>
+                <p className="text-xs text-muted-foreground">
+                  Polls the pipeline and waits for completion before the delete
+                  MR.
+                </p>
+              </div>
+              <Switch
+                checked={optWait}
+                onCheckedChange={setOptWait}
+                disabled={!optDestroy}
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label>Delete Terraform state</Label>
+                <p className="text-xs text-muted-foreground">
+                  Removes the lab&apos;s tfstate blob after destruction.
+                </p>
+              </div>
+              <Switch
+                checked={optDeleteState}
+                onCheckedChange={setOptDeleteState}
+              />
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setDeleteOpen(false)}
+              disabled={deleteWorking}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={confirmDelete}
+              disabled={deleteWorking}
+            >
+              {deleteWorking ? "Deleting…" : "Delete Lab"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </SidebarProvider>
   );
 }

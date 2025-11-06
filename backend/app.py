@@ -1,14 +1,22 @@
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask_cors import CORS , cross_origin
+from flask_cors import CORS, cross_origin
 from dotenv import load_dotenv
 from functools import wraps
 from datetime import datetime, timedelta, timezone
 import jwt, os
 
 # GitLab helpers
-from gitlab_utils import MODULE_SCHEMAS, create_lab_in_gitlab
+from gitlab_utils import (
+    MODULE_SCHEMAS,
+    create_lab_in_gitlab,
+    course_dir,
+    trigger_destroy_pipeline,
+    wait_for_pipeline,
+    create_delete_lab_mr,
+    GITLAB_PROJECT_ID,
+)
 
 # Azure Blob
 from azure.storage.blob import (
@@ -19,14 +27,11 @@ from azure.storage.blob import (
 
 from azure_client import list_running_labs, start_vm_by_id, stop_vm_by_id
 
-
-
 # ---------- Load env ----------
 load_dotenv()
 
 # ---------- Flask / CORS ----------
 app = Flask(__name__)
-# after app = Flask(__name__)
 CORS(
     app,
     resources={r"/api/*": {"origins": ["http://localhost:8080", "http://127.0.0.1:8080"]}},
@@ -35,7 +40,6 @@ CORS(
     expose_headers=["Content-Type"],
     methods=["GET", "POST", "OPTIONS"],
 )
-
 
 # ---------- Config ----------
 app.config["SECRET_KEY"] = os.environ.get("JWT_SECRET", "fallback-secret")
@@ -218,77 +222,33 @@ def get_state_sas_url(blob_name: str):
         return jsonify({"error": "Failed to generate SAS URL"}), 500
 
 # ---------- Create lab in GitLab ----------
-@app.route("/api/labs/create", methods=["POST", "OPTIONS"])
-@cross_origin(
-    origins=["http://localhost:8080", "http://127.0.0.1:8080"],
-    methods=["POST", "OPTIONS"],
-    headers=["Content-Type", "Authorization"],
-)
+@app.route("/api/labs/create", methods=["POST"])
 def create_lab():
-    if request.method == "OPTIONS":
-        # CORS preflight
-        return ("", 204)
-
     try:
         data = request.get_json(force=True) or {}
-        body_params = data.get("params") or {}
 
-        # accept both top-level and nested keys
-        course = (data.get("course") or body_params.get("course") or "").strip()
-        lab_name = (
-            data.get("lab_name")
-            or data.get("lab")
-            or body_params.get("lab_name")
-            or body_params.get("lab")
-            or ""
-        ).strip()
-        module_name = (data.get("module_name") or "WindowsSnapshot").strip()
+        course       = (data.get("course") or "").strip()
+        lab_name     = (data.get("lab_name") or "").strip()
+        module_name  = (data.get("module_name") or "").strip()
+        expires_at   = data.get("expires_at")  # ISO string from UI
+        params       = data.get("params") or {}
 
-        # VM params (accept both locations and alternative names)
-        vm_count = int(body_params.get("vm_count") or data.get("vm_count") or 1)
-        vm_size = (body_params.get("vm_size") or data.get("vm_size") or "").strip()
-        snapshot_id = (
-            body_params.get("snapshot_id")
-            or data.get("snapshot_id")
-            or data.get("snapshot_resource_id")
-            or ""
-        ).strip()
-        data_disks = body_params.get("data_disks") or data.get("data_disks") or []
+        if not course or not lab_name or not module_name:
+            return jsonify({"error": "Missing course, lab_name or module_name"}), 400
 
-        # lifecycle / tags
-        expires_at = data.get("expires_at") or body_params.get("expires_at")
+        # pass expiry into tf_vars for tag usage (CreatedAt is now-ish)
+        params = dict(params)
+        params.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        if expires_at:
+            params["expires_at"] = expires_at
 
-        # basic validation
-        if not course or not lab_name:
-            return jsonify({"error": "Missing course or lab name"}), 400
-        if not vm_size or not snapshot_id:
-            return jsonify({"error": "Missing vm_size or snapshot_id"}), 400
-
-        # pass exactly what the templates expect under tf_vars
-               # pass exactly what the templates expect under tf_vars
-        tf_vars = {
-            "course": course,            # << add this
-            "lab_name": lab_name,        # << and this
-            "vm_count": vm_count,
-            "vm_size": vm_size,
-            "snapshot_id": snapshot_id,
-            "data_disks": data_disks,
-            "expires_at": expires_at,    # used for tagging/cleanup
-        }
-
-        # create branch + files + MR in GitLab
-        result = create_lab_in_gitlab(course, lab_name, module_name, tf_vars)
-
+        result = create_lab_in_gitlab(course, lab_name, module_name, params)
         return jsonify(result), 200
-
-
     except Exception as e:
         print("[/api/labs/create] Error:", e)
-        return jsonify({"error": "Failed to create lab"}), 500
+        return jsonify({"error": str(e)}), 500
 
-
-
-# ---------- NEW: Running labs (VMs + IPs) ----------
+# ---------- Running labs (VMs + IPs) ----------
 @app.route("/api/labs/running", methods=["GET"])
 @token_required
 def labs_running():
@@ -296,31 +256,27 @@ def labs_running():
         labs = list_running_labs()
         return jsonify({"labs": labs}), 200
     except Exception as e:
-        # Log but do not leak internals
         print(f"[labs_running] Error: {e}")
         return jsonify({"error": "Failed to fetch running labs"}), 500
-    
 
+# ---------- VM power ops ----------
 @app.route("/api/vm/start", methods=["POST", "OPTIONS"])
 @cross_origin(origins=["http://localhost:8080", "http://127.0.0.1:8080"],
               methods=["POST", "OPTIONS"],
               headers=["Content-Type", "Authorization"])
 def api_vm_start():
     if request.method == "OPTIONS":
-        # Preflight
         return ("", 204)
     data = request.get_json(force=True) or {}
     vm_id = data.get("vm_id")
     if not vm_id:
         return jsonify({"error": "vm_id required"}), 400
     try:
-        from azure_client import start_vm_by_id
         start_vm_by_id(vm_id)
         return jsonify({"status": "start_requested"}), 200
     except Exception as e:
         print("[vm_start] Error:", e)
         return jsonify({"error": "Failed to request start"}), 500
-
 
 @app.route("/api/vm/stop", methods=["POST", "OPTIONS"])
 @cross_origin(origins=["http://localhost:8080", "http://127.0.0.1:8080"],
@@ -328,7 +284,6 @@ def api_vm_start():
               headers=["Content-Type", "Authorization"])
 def api_vm_stop():
     if request.method == "OPTIONS":
-        # Preflight
         return ("", 204)
     data = request.get_json(force=True) or {}
     vm_id = data.get("vm_id")
@@ -336,12 +291,63 @@ def api_vm_stop():
     if not vm_id:
         return jsonify({"error": "vm_id required"}), 400
     try:
-        from azure_client import stop_vm_by_id
         stop_vm_by_id(vm_id, deallocate=deallocate)
         return jsonify({"status": "deallocate_requested" if deallocate else "poweroff_requested"}), 200
     except Exception as e:
         print("[vm_stop] Error:", e)
         return jsonify({"error": "Failed to request stop"}), 500
+
+# --- Delete Lab (destroy + delete MR) ---
+@app.route("/api/labs/delete", methods=["POST", "OPTIONS"])
+@cross_origin(
+    origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    methods=["POST", "OPTIONS"],
+    headers=["Content-Type", "Authorization"],
+)
+def api_labs_delete():
+    # Handle preflight cleanly
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    # Lightweight token check (don't use @token_required so OPTIONS isn't blocked)
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify({"error": "Unauthorized"}), 401
+    token = auth.split(" ", 1)[1]
+    try:
+        jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        return jsonify({"error": "Token expired"}), 401
+    except Exception:
+        return jsonify({"error": "Invalid token"}), 401
+
+    # Body
+    data = request.get_json(force=True) or {}
+    course = (data.get("course") or "").strip()
+    lab_id = (data.get("lab_id") or "").strip()
+    destroy = bool(data.get("destroy", True))
+    wait_for_destroy = bool(data.get("wait_for_destroy", False))
+    delete_state = bool(data.get("delete_state", False))
+
+    if not course or not lab_id:
+        return jsonify({"error": "course and lab_id are required"}), 400
+
+    try:
+        # Call the helper you added in gitlab_utils
+        from gitlab_utils import delete_lab
+
+        result = delete_lab(
+            course=course,
+            lab_id=lab_id,
+            destroy=destroy,
+            wait_for_destroy=wait_for_destroy,
+            delete_state=delete_state,
+        )
+        return jsonify(result), 200
+    except Exception as e:
+        print("[api/labs/delete] Error:", e)
+        return jsonify({"error": "Failed to request lab deletion"}), 500
+
 
 @app.after_request
 def add_cors_headers(resp):
