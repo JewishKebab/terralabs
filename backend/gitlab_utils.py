@@ -248,34 +248,142 @@ def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: d
 
 
 # -----------------------
-# Delete lab (open MR)
+# Delete lab (open MR) — accepts lab_name OR lab_id
 # -----------------------
-def create_delete_lab_mr(course: str, lab_name: str, base_branch: str = "main") -> Dict[str, Any]:
+def create_delete_lab_mr(
+    course: str,
+    lab_name: Optional[str] = None,
+    *,
+    lab_id: Optional[str] = None,
+    base_branch: str = "main",
+) -> Dict[str, Any]:
     """
-    Creates a branch + commit that deletes all files under Labs/<Course>/<lab_name>, then opens an MR.
+    Creates a branch + commit that deletes all files under Labs/<Course>/<lab>, then opens an MR.
+    You may pass either lab_name or lab_id (they are treated the same).
     """
+    actual_lab = (lab_name or lab_id or "").strip()
+    if not actual_lab:
+        raise ValueError("create_delete_lab_mr: require lab_name or lab_id")
+
     course_folder = course_dir(course)
-    lab_folder = f"Labs/{course_folder}/{lab_name}"
+    lab_folder = f"Labs/{course_folder}/{actual_lab}"
 
     # list files
     tree = _list_repo_tree(lab_folder, ref=base_branch)
     files = [t["path"] for t in tree if t.get("type") == "blob"]
 
-    # nothing to do?
-    if not files:
-        # still open a tiny MR (optional); here we'll just return empty result
-        branch = f"tlabs/delete-{course_folder}-{lab_name}".lower()
-        ensure_branch(branch, base_branch)
-        mr_url = create_merge_request(branch, base_branch, f"[TerraLabs] Delete lab {course_folder}/{lab_name}")
-        return {"branch": branch, "merge_request_url": mr_url, "lab_folder": lab_folder}
-
-    # create branch & delete commit
-    branch = f"tlabs/delete-{course_folder}-{lab_name}".replace(" ", "-").lower()
+    # create branch
+    branch = f"tlabs/delete-{course_folder}-{actual_lab}".replace(" ", "-").lower()
     ensure_branch(branch, base_branch)
 
-    actions = [{"action": "delete", "file_path": p} for p in files]
-    message = f"[TerraLabs] Remove {course_folder}/{lab_name}"
-    _commit_actions(branch, message, actions, start_branch=base_branch)
+    if files:
+        actions = [{"action": "delete", "file_path": p} for p in files]
+        message = f"[TerraLabs] Remove {course_folder}/{actual_lab}"
+        _commit_actions(branch, message, actions, start_branch=base_branch)
 
-    mr_url = create_merge_request(branch, base_branch, f"[TerraLabs] Delete lab {course_folder}/{lab_name}")
+    mr_url = create_merge_request(branch, base_branch, f"[TerraLabs] Delete lab {course_folder}/{actual_lab}")
     return {"branch": branch, "merge_request_url": mr_url, "lab_folder": lab_folder}
+
+
+# -----------------------
+# Delete lab: destroy (+ optional wait) -> delete MR -> optional tfstate cleanup
+# -----------------------
+def _delete_state_blob_if_present(course: str, lab_name: str) -> bool:
+    """
+    Best-effort delete of 'Labs/<Course>/<lab>.tfstate' (or '<course>/<lab>.tfstate') in Azure Blob.
+    Returns True if delete call was made and did not raise, False otherwise.
+    """
+    try:
+        from azure.storage.blob import BlobServiceClient
+        acct = os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
+        key = os.getenv("AZURE_BLOB_KEY")
+        container = os.getenv("AZURE_CONTAINER_NAME")
+        if not (acct and key and container):
+            return False
+
+        blob_service = BlobServiceClient(
+            account_url=f"https://{acct}.blob.core.windows.net",
+            credential=key,
+        )
+        container_client = blob_service.get_container_client(container)
+
+        # try both name styles (depends how you stored it)
+        candidates = [
+            f"{course_dir(course)}/{lab_name}.tfstate",
+            f"{lab_name}.tfstate",
+            f"Labs/{course_dir(course)}/{lab_name}.tfstate",
+        ]
+        done = False
+        for blob_name in candidates:
+            try:
+                container_client.delete_blob(blob_name)
+                done = True
+            except Exception:
+                pass
+        return done
+    except Exception:
+        return False
+
+
+# -----------------------
+# Delete lab: destroy (+ optional wait) -> delete MR -> optional tfstate cleanup
+# accepts lab_name OR lab_id
+# -----------------------
+def delete_lab(
+    course: str,
+    lab_name: Optional[str] = None,
+    *,
+    lab_id: Optional[str] = None,
+    destroy: bool = True,
+    wait_for_destroy: bool = False,
+    delete_state: bool = False,
+    base_branch: str = "main",
+) -> Dict[str, Any]:
+    """
+    High-level delete workflow:
+      1) (optional) Trigger a destroy pipeline (your CI must support TF_ACTION=destroy)
+      2) (optional) Wait for pipeline
+      3) Open MR that deletes Labs/<Course>/<lab>
+      4) (optional) Delete tfstate blob
+    """
+    actual_lab = (lab_name or lab_id or "").strip()
+    if not actual_lab:
+        raise ValueError("delete_lab: require lab_name or lab_id")
+
+    result: Dict[str, Any] = {}
+
+    # 1) Destroy
+    if destroy:
+        try:
+            trig = trigger_destroy_pipeline(course, actual_lab)
+            destroy_info = {
+                "triggered": True,
+                "pipeline_id": trig.get("id"),
+                "web_url": trig.get("web_url"),
+                "final_status": None,
+            }
+            if wait_for_destroy and trig.get("id"):
+                status = wait_for_pipeline(
+                    project_id=str(GITLAB_PROJECT_ID),
+                    pipeline_id=int(trig["id"]),
+                    timeout_s=900,
+                    poll_s=6,
+                )
+                destroy_info["final_status"] = status
+            result["destroy"] = destroy_info
+        except Exception as e:
+            result["destroy"] = {"triggered": False, "error": str(e)}
+
+    # 2) Delete lab folder via MR
+    try:
+        delete_info = create_delete_lab_mr(course, lab_name=actual_lab, base_branch=base_branch)
+        result["delete_mr"] = delete_info
+    except Exception as e:
+        result["delete_mr"] = {"error": str(e)}
+
+    # 3) Optional state cleanup
+    result["state_deleted"] = False
+    if delete_state:
+        result["state_deleted"] = _delete_state_blob_if_present(course, actual_lab)
+
+    return result
