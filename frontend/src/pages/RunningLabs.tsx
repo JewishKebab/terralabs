@@ -30,7 +30,6 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
-import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
 import {
@@ -73,13 +72,10 @@ export default function RunningLabsPage() {
   const [qIp, setQIp] = useState("");
   const [courseFilter, setCourseFilter] = useState<string>("__all__");
 
-  // Delete dialog
+  // Delete dialog (single confirmation)
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteWorking, setDeleteWorking] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Lab | null>(null);
-  const [optDestroy, setOptDestroy] = useState(true);
-  const [optWait, setOptWait] = useState(false);
-  const [optDeleteState, setOptDeleteState] = useState(false);
 
   const api = useMemo(() => {
     const i = axios.create({
@@ -148,9 +144,6 @@ export default function RunningLabsPage() {
   // Delete flow
   const openDelete = (lab: Lab) => {
     setDeleteTarget(lab);
-    setOptDestroy(true);
-    setOptWait(false);
-    setOptDeleteState(false);
     setDeleteOpen(true);
   };
 
@@ -161,17 +154,13 @@ export default function RunningLabsPage() {
       const body = {
         course: deleteTarget.course,
         lab_id: deleteTarget.lab_id,
-        destroy: optDestroy,
-        wait_for_destroy: optWait,
-        delete_state: optDeleteState,
       };
       const res = await api.post("/api/labs/delete", body);
 
+      const mrUrl = res?.data?.delete_mr?.merge_request_url;
       toast({
         title: "Delete requested",
-        description: res?.data?.delete_mr?.merge_request_url
-          ? "MR opened to remove lab files."
-          : "Request submitted.",
+        description: mrUrl ? `MR opened: ${mrUrl}` : "Azure deletion + MR requested.",
       });
 
       setDeleteOpen(false);
@@ -402,64 +391,24 @@ export default function RunningLabsPage() {
         </div>
       </div>
 
-      {/* Delete dialog */}
+      {/* Delete dialog (are you sure) */}
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Delete Lab</DialogTitle>
             <DialogDescription>
-              This will (optionally) destroy all VMs and open a Merge Request to
-              remove the lab files from GitLab.
+              This will delete all Azure resources tagged for this lab, open a
+              Merge Request that removes the lab folder from GitLab, and delete
+              the lab&apos;s Terraform state. This action cannot be undone.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-4 py-2">
-            <div className="text-sm">
-              <div>
-                <span className="font-medium">Course:</span> {deleteTarget?.course}
-              </div>
-              <div>
-                <span className="font-medium">Lab:</span> {deleteTarget?.lab_id}
-              </div>
+          <div className="space-y-2 py-2 text-sm">
+            <div>
+              <span className="font-medium">Course:</span> {deleteTarget?.course}
             </div>
-
-            <div className="flex items-center justify-between">
-              <div className="space-y-0.5">
-                <Label>Destroy resources first</Label>
-                <p className="text-xs text-muted-foreground">
-                  Triggers the CI with TF_ACTION=destroy before deleting lab
-                  files.
-                </p>
-              </div>
-              <Switch checked={optDestroy} onCheckedChange={setOptDestroy} />
-            </div>
-
-            <div className="flex items-center justify-between">
-              <div className="space-y-0.5">
-                <Label>Wait for destroy to finish</Label>
-                <p className="text-xs text-muted-foreground">
-                  Polls the pipeline and waits for completion before the delete
-                  MR.
-                </p>
-              </div>
-              <Switch
-                checked={optWait}
-                onCheckedChange={setOptWait}
-                disabled={!optDestroy}
-              />
-            </div>
-
-            <div className="flex items-center justify-between">
-              <div className="space-y-0.5">
-                <Label>Delete Terraform state</Label>
-                <p className="text-xs text-muted-foreground">
-                  Removes the lab&apos;s tfstate blob after destruction.
-                </p>
-              </div>
-              <Switch
-                checked={optDeleteState}
-                onCheckedChange={setOptDeleteState}
-              />
+            <div>
+              <span className="font-medium">Lab:</span> {deleteTarget?.lab_id}
             </div>
           </div>
 
@@ -476,7 +425,7 @@ export default function RunningLabsPage() {
               onClick={confirmDelete}
               disabled={deleteWorking}
             >
-              {deleteWorking ? "Deleting…" : "Delete Lab"}
+              {deleteWorking ? "Deleting…" : "Yes, delete everything"}
             </Button>
           </DialogFooter>
         </DialogContent>

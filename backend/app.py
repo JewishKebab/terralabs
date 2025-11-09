@@ -7,15 +7,12 @@ from functools import wraps
 from datetime import datetime, timedelta, timezone
 import jwt, os
 
-# GitLab helpers
+# GitLab helpers (create + high-level delete flow)
 from gitlab_utils import (
     MODULE_SCHEMAS,
     create_lab_in_gitlab,
     course_dir,
-    trigger_destroy_pipeline,
-    wait_for_pipeline,
-    create_delete_lab_mr,
-    GITLAB_PROJECT_ID,
+    delete_lab as delete_lab_flow,  # Azure deletion + repo MR + tfstate delete
 )
 
 # Azure Blob
@@ -30,6 +27,7 @@ from azure_client import list_running_labs, start_vm_by_id, stop_vm_by_id
 
 # ---------- Load env ----------
 load_dotenv(override=True)
+
 # ---------- Flask / CORS ----------
 app = Flask(__name__)
 CORS(
@@ -297,7 +295,7 @@ def api_vm_stop():
         print("[vm_stop] Error:", e)
         return jsonify({"error": "Failed to request stop"}), 500
 
-# ---------- Delete lab flow: destroy → delete-files MR ----------
+# ---------- Delete lab: Azure deletion → MR remove folder → delete tfstate ----------
 @app.route("/api/labs/delete", methods=["POST", "OPTIONS"])
 @cross_origin(
     origins=["http://localhost:8080", "http://127.0.0.1:8080"],
@@ -306,54 +304,31 @@ def api_vm_stop():
 )
 @token_required
 def delete_lab():
-    # Handle CORS preflight (OPTIONS)
     if request.method == "OPTIONS":
         return ("", 204)
-
     try:
         data = request.get_json(force=True) or {}
         course = (data.get("course") or "").strip()
         lab_id = (data.get("lab_id") or "").strip()
-        destroy = bool(data.get("destroy", True))
-        wait = bool(data.get("wait_for_destroy", False))
-        delete_state = bool(data.get("delete_state", False))
 
         if not course or not lab_id:
             return jsonify({"error": "course and lab_id are required"}), 400
 
-        # Trigger destroy pipeline
-        destroy_status = None
-        pipeline_id = None
-        if destroy:
-            p = trigger_destroy_pipeline(course, lab_id)
-            pipeline_id = p.get("id")
-            if wait and pipeline_id:
-                destroy_status = wait_for_pipeline(GITLAB_PROJECT_ID, pipeline_id, timeout_s=1800, poll_s=8)
-            else:
-                destroy_status = "queued"
+        result = delete_lab_flow(
+            course,
+            lab_id=lab_id,
+            azure_dry_run=False,
+            wait_for_azure=True,
+            delete_state=True,
+        )
 
-        # After destroy (or immediately), delete files from GitLab
-        mr = create_delete_lab_mr(course, lab_id=lab_id)
-
-        # Delete tfstate blob (optional)
-        if delete_state:
-            try:
-                from gitlab_utils import _delete_state_blob_if_present
-                _delete_state_blob_if_present(course, lab_id)
-            except Exception as e:
-                print("[delete_lab] blob delete:", e)
-
-        return jsonify({
-            "status": "delete_requested",
-            "destroy": {"triggered": destroy, "pipeline_id": pipeline_id, "final_status": destroy_status},
-            "delete_mr": mr,
-        }), 200
+        return jsonify({"status": "delete_requested", **result}), 200
 
     except Exception as e:
         print("[/api/labs/delete] Error:", e)
         return jsonify({"error": str(e)}), 500
 
-
+# ---------- CORS headers after each request ----------
 @app.after_request
 def add_cors_headers(resp):
     resp.headers.setdefault("Access-Control-Allow-Origin", "http://localhost:8080")
@@ -361,7 +336,7 @@ def add_cors_headers(resp):
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     return resp
 
-
+# ---------- Debug ----------
 @app.route("/api/debug/azure", methods=["GET"])
 @token_required
 def debug_azure():

@@ -39,6 +39,7 @@ default:
 # PLAN (always on MR or main)
 "plan_$[[ inputs.counter ]]":
   stage: plan
+  allow_failure: true
   image:
     name: sharedservicesbsmchprodacr.azurecr.io/asgard/terraops:latest
     entrypoint: ["/bin/sh", "-c"]
@@ -77,7 +78,6 @@ default:
     - when: never
 
 # ---------------------------------------------------
-# DESTROY (manual on main only)#
 "destroy_$[[ inputs.counter ]]":
   stage: destroy
   image:
@@ -89,7 +89,9 @@ default:
     - terraform init
     - terraform destroy -auto-approve
   rules:
+    # 1) Auto-run when you trigger via API with TF_ACTION=destroy
+    - if: '$TF_ACTION == "destroy"'
+      when: on_success
+    # 2) Otherwise show manual button on main
     - if: '$CI_COMMIT_BRANCH == "main"'
       when: manual
-    - when: never
-

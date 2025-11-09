@@ -1,3 +1,4 @@
+# backend/gitlab_utils.py
 import os
 import json
 import time
@@ -8,30 +9,22 @@ from typing import List, Dict, Any, Optional
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
-# --- Disable SSL warnings & verification ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 REQUESTS_VERIFY = False
 
-# --- GitLab env vars ---
 GITLAB_HOST = os.getenv("GITLAB_HOST", "https://gitlab.com")
 GITLAB_PROJECT_ID = os.getenv("GITLAB_PROJECT_ID")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
 GITLAB_API = f"{GITLAB_HOST}/api/v4"
 
-# one session
 SESSION = requests.Session()
 SESSION.verify = REQUESTS_VERIFY
 SESSION.headers.update({"PRIVATE-TOKEN": GITLAB_TOKEN})
 
-# --- Jinja setup ---
 TEMPLATES_ROOT = os.path.join(os.path.dirname(__file__), "templates")
-jinja = Environment(
-    loader=FileSystemLoader(TEMPLATES_ROOT),
-    autoescape=select_autoescape()
-)
+jinja = Environment(loader=FileSystemLoader(TEMPLATES_ROOT), autoescape=select_autoescape())
 jinja.filters["tojson"] = lambda value: json.dumps(value, indent=2)
 
-# --- Schema registry (kept minimal here) ---
 MODULE_SCHEMAS = {
     "WindowsSnapshot": {
         "title": "Windows VM from Snapshot",
@@ -58,9 +51,6 @@ MODULE_SCHEMAS = {
     }
 }
 
-# -----------------------
-# Helpers (naming/paths)
-# -----------------------
 def course_dir(course: str) -> str:
     c = (course or "").strip()
     return c[:1].upper() + c[1:].lower()
@@ -68,48 +58,50 @@ def course_dir(course: str) -> str:
 def _gl(path: str) -> str:
     return f"{GITLAB_API}{path}"
 
-# -----------------------
-# Branch / Commit helpers
-# -----------------------
-def ensure_branch(branch: str, base_branch: str = "main"):
-    r = SESSION.get(
-        _gl(f"/projects/{GITLAB_PROJECT_ID}/repository/branches/{urllib.parse.quote(branch, safe='')}")
-    )
+# -------------------------------------------------------------------
+# Branch / Commit helpers (kept for CREATE flow)
+# -------------------------------------------------------------------
+def ensure_branch(branch: str, base_branch: str = "main") -> bool:
+    """
+    Ensure branch exists. Returns True if it ALREADY existed, False if just created.
+    """
+    r = SESSION.get(_gl(f"/projects/{GITLAB_PROJECT_ID}/repository/branches/{urllib.parse.quote(branch, safe='')}"))
     if r.status_code == 200:
-        return
+        return True
     r = SESSION.post(
         _gl(f"/projects/{GITLAB_PROJECT_ID}/repository/branches"),
         json={"branch": branch, "ref": base_branch},
     )
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Failed to create branch {branch}: {r.status_code} {r.text}")
+    return False
 
-def gitlab_upsert_file(path: str, content: str, commit_message: str, branch: str):
-    if not (GITLAB_PROJECT_ID and GITLAB_TOKEN):
-        raise RuntimeError("Missing GitLab configuration")
-
-    file_url = _gl(f"/projects/{GITLAB_PROJECT_ID}/repository/files/{urllib.parse.quote(path, safe='')}")
-    data = {"branch": branch, "content": content, "commit_message": commit_message, "encoding": "text"}
-
-    exists = SESSION.get(file_url, params={"ref": branch})
-    if exists.status_code == 200:
-        res = SESSION.put(file_url, data=data)
-    else:
-        res = SESSION.post(file_url, data=data)
-
-    if res.status_code not in (200, 201):
-        raise RuntimeError(f"GitLab upsert failed for {path}: {res.status_code} {res.text}")
-
-def _commit_actions(branch: str, message: str, actions: list, start_branch="main"):
+def _commit_actions(branch: str, message: str, actions: list):
+    """
+    Commit actions to an EXISTING branch. We NEVER send start_branch here;
+    we call ensure_branch() first to create it when needed. This avoids the
+    GitLab 400 'branch already exists' error.
+    """
     payload = {
         "branch": branch,
-        "start_branch": start_branch,
         "commit_message": message,
         "actions": actions,
     }
     r = SESSION.post(_gl(f"/projects/{GITLAB_PROJECT_ID}/repository/commits"), json=payload)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Commit failed: {r.status_code} {r.text}")
+
+def _find_open_mr_for_source_branch(source_branch: str) -> Optional[str]:
+    """
+    Return web_url of an OPEN MR for the given source_branch if any.
+    """
+    params = {"source_branch": source_branch, "state": "opened"}
+    r = SESSION.get(_gl(f"/projects/{GITLAB_PROJECT_ID}/merge_requests"), params=params)
+    if r.status_code == 200:
+        arr = r.json() or []
+        if arr:
+            return arr[0].get("web_url")
+    return None
 
 def create_merge_request(source_branch: str, target_branch: str = "main", title: str = None):
     payload = {
@@ -119,32 +111,18 @@ def create_merge_request(source_branch: str, target_branch: str = "main", title:
         "remove_source_branch": True,
     }
     res = SESSION.post(_gl(f"/projects/{GITLAB_PROJECT_ID}/merge_requests"), data=payload)
-    if res.status_code not in (200, 201):
-        raise RuntimeError(f"Failed to create merge request: {res.status_code} {res.text}")
-    return res.json().get("web_url")
+    if res.status_code in (200, 201):
+        return res.json().get("web_url")
+    # If an MR already exists, GitLab responds 409. Return that MR instead.
+    if res.status_code == 409:
+        url = _find_open_mr_for_source_branch(source_branch)
+        if url:
+            return url
+    raise RuntimeError(f"Failed to create merge request: {res.status_code} {res.text}")
 
-# -----------------------
-# Repo tree helpers
-# -----------------------
-def _list_repo_tree(path: str, ref="main") -> List[Dict[str, Any]]:
-    out = []
-    page = 1
-    while True:
-        resp = SESSION.get(
-            _gl(f"/projects/{GITLAB_PROJECT_ID}/repository/tree"),
-            params={"ref": ref, "path": path, "recursive": True, "per_page": 100, "page": page},
-        )
-        resp.raise_for_status()
-        items = resp.json()
-        out.extend(items)
-        if len(items) < 100:
-            break
-        page += 1
-    return out
-
-# -----------------------
-# Pipelines (destroy)
-# -----------------------
+# -------------------------------------------------------------------
+# Pipelines (optional, left as-is if you want to trigger CI externally)
+# -------------------------------------------------------------------
 def trigger_destroy_pipeline(course: str, lab_name: str) -> Dict[str, Any]:
     payload = {
         "ref": "main",
@@ -159,7 +137,6 @@ def trigger_destroy_pipeline(course: str, lab_name: str) -> Dict[str, Any]:
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Failed to trigger destroy pipeline: {r.status_code} {r.text}")
     return r.json()
-
 
 def get_pipeline(project_id: str, pipeline_id: int) -> Dict[str, Any]:
     r = SESSION.get(_gl(f"/projects/{project_id}/pipelines/{pipeline_id}"))
@@ -182,19 +159,14 @@ def wait_for_pipeline(project_id: str, pipeline_id: int, timeout_s: int = 900, p
         time.sleep(poll_s)
     return last_status
 
-# -----------------------
-# Create lab (templates)
-# -----------------------
+# -------------------------------------------------------------------
+# Create lab (templates) — unchanged
+# -------------------------------------------------------------------
 def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: dict, base_branch="main"):
     if not (GITLAB_PROJECT_ID and GITLAB_TOKEN):
         raise RuntimeError("Missing GitLab configuration")
 
-    ctx = {
-        "course": course,
-        "lab_name": lab_name,
-        "module_name": module_name,
-        "tf_vars": params,   # contains vm_count, vm_size, snapshot_id, created_at, expires_at, data_disks
-    }
+    ctx = {"course": course, "lab_name": lab_name, "module_name": module_name, "tf_vars": params}
 
     module_path = os.path.join(module_name)
     course_folder = course_dir(course)
@@ -219,47 +191,16 @@ def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: d
     }
 
     for path, content in files.items():
-        gitlab_upsert_file(path, content, f"[TerraLabs] Create {course_folder}/{lab_name}", branch_name)
+        _commit_actions(branch_name, f"[TerraLabs] Create {course_folder}/{lab_name}", [
+            {"action": "create", "file_path": path, "content": content}
+        ])
 
     mr_url = create_merge_request(branch_name, base_branch, f"[TerraLabs] {course_folder}/{lab_name}")
     return {"lab_folder": lab_folder, "branch": branch_name, "merge_request_url": mr_url}
 
-# -----------------------
-# Delete lab (open MR) — accepts lab_name OR lab_id
-# -----------------------
-def create_delete_lab_mr(
-    course: str,
-    lab_name: Optional[str] = None,
-    *,
-    lab_id: Optional[str] = None,
-    base_branch: str = "main",
-) -> Dict[str, Any]:
-    actual_lab = (lab_name or lab_id or "").strip()
-    if not actual_lab:
-        raise ValueError("create_delete_lab_mr: require lab_name or lab_id")
-
-    course_folder = course_dir(course)
-    lab_folder = f"Labs/{course_folder}/{actual_lab}"
-
-    # list files
-    tree = _list_repo_tree(lab_folder, ref=base_branch)
-    files = [t["path"] for t in tree if t.get("type") == "blob"]
-
-    # create branch
-    branch = f"tlabs/delete-{course_folder}-{actual_lab}".replace(" ", "-").lower()
-    ensure_branch(branch, base_branch)
-
-    if files:
-        actions = [{"action": "delete", "file_path": p} for p in files]
-        message = f"[TerraLabs] Remove {course_folder}/{actual_lab}"
-        _commit_actions(branch, message, actions, start_branch=base_branch)
-
-    mr_url = create_merge_request(branch, base_branch, f"[TerraLabs] Delete lab {course_folder}/{actual_lab}")
-    return {"branch": branch, "merge_request_url": mr_url, "lab_folder": lab_folder}
-
-# -----------------------
+# -------------------------------------------------------------------
 # Optional tfstate cleanup helper
-# -----------------------
+# -------------------------------------------------------------------
 def _delete_state_blob_if_present(course: str, lab_name: str) -> bool:
     try:
         from azure.storage.blob import BlobServiceClient
@@ -289,3 +230,35 @@ def _delete_state_blob_if_present(course: str, lab_name: str) -> bool:
         return done
     except Exception:
         return False
+
+# -------------------------------------------------------------------
+# High-level delete flow (Azure ➜ optional tfstate) — NO MR CREATION
+# -------------------------------------------------------------------
+def delete_lab(
+    course: str,
+    *,
+    lab_id: str,
+    azure_dry_run: bool = False,
+    wait_for_azure: bool = True,  # kept for API compatibility; deletion is synchronous in our SDK call
+    delete_state: bool = True,
+) -> Dict[str, Any]:
+    """
+    Delete Azure resources by tags and (optionally) delete the tfstate blob.
+    This version DOES NOT create a merge request or touch the Git repo for deletions.
+    """
+    from azure_client import delete_lab_resources  # lazy import to avoid cycles
+
+    course_folder = course_dir(course)
+
+    # 1) Azure deletion via SDK (synchronous)
+    azure_summary = delete_lab_resources(lab_id=lab_id, course=course_folder, dry_run=azure_dry_run)
+
+    # 2) Optionally delete tfstate blob
+    state_deleted = False
+    if delete_state and not azure_dry_run:
+        state_deleted = _delete_state_blob_if_present(course, lab_id)
+
+    return {
+        "azure": azure_summary,
+        "tfstate_deleted": state_deleted,
+    }
