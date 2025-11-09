@@ -1,20 +1,29 @@
-# Derived VM name (Course + Lab formatted)
-{% set course_fmt = tf_vars.course[0].upper() + tf_vars.course[1:].lower() %}
+# -------------------------
+# Terraform variables file
+# -------------------------
+
+{# Course is passed at TOP LEVEL, not inside tf_vars #}
+{% set course_fmt = course[:1].upper() + course[1:].lower() %}
+
+{# Lab name without any folder prefix or .tfstate suffix #}
 {% set lab_raw = (lab_name.split('/')[-1] | replace('.tfstate', '')) %}
-{% set lab_fmt = lab_raw[0].upper() + lab_raw[1:] %}
+{% set lab_fmt = lab_raw[:1].upper() + lab_raw[1:] %}
+
+# Derived VM name (Projects-<Course>-<Lab>-VM)
 vm_name = "Projects-{{ course_fmt }}-{{ lab_fmt }}-VM"
 
-# lifecycle
-lab_id     = "{{ (lab_name.split('/')[-1] | replace('.tfstate', '')) }}"
+# Lifecycle tags / metadata
+lab_id     = "{{ lab_raw }}"
 created_at = "{{ tf_vars.created_at }}"
 expires_at = "{{ tf_vars.expires_at }}"
 course     = "{{ course }}"
 
-# module params
-vm_count    = {{ tf_vars.vm_count }}
-vm_size     = "{{ tf_vars.vm_size }}"
+# Module parameters
+vm_count       = {{ tf_vars.vm_count }}
+vm_size        = "{{ tf_vars.vm_size }}"
 os_snapshot_id = "{{ tf_vars.snapshot_id }}"
 
+# Optional data disks
 data_disks = [
 {% if tf_vars.data_disks and tf_vars.data_disks|length > 0 -%}
 {%- for d in tf_vars.data_disks -%}

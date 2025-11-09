@@ -25,11 +25,11 @@ from azure.storage.blob import (
     generate_blob_sas
 )
 
+# Azure VM helpers
 from azure_client import list_running_labs, start_vm_by_id, stop_vm_by_id
 
 # ---------- Load env ----------
-load_dotenv()
-
+load_dotenv(override=True)
 # ---------- Flask / CORS ----------
 app = Flask(__name__)
 CORS(
@@ -236,7 +236,7 @@ def create_lab():
         if not course or not lab_name or not module_name:
             return jsonify({"error": "Missing course, lab_name or module_name"}), 400
 
-        # pass expiry into tf_vars for tag usage (CreatedAt is now-ish)
+        # add lifecycle timestamps into tf_vars so templates can read them
         params = dict(params)
         params.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         if expires_at:
@@ -297,56 +297,61 @@ def api_vm_stop():
         print("[vm_stop] Error:", e)
         return jsonify({"error": "Failed to request stop"}), 500
 
-# --- Delete Lab (destroy + delete MR) ---
+# ---------- Delete lab flow: destroy → delete-files MR ----------
 @app.route("/api/labs/delete", methods=["POST", "OPTIONS"])
 @cross_origin(
     origins=["http://localhost:8080", "http://127.0.0.1:8080"],
     methods=["POST", "OPTIONS"],
-    headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization"]
 )
-def api_labs_delete():
-    # Handle preflight cleanly
+@token_required
+def delete_lab():
+    # Handle CORS preflight (OPTIONS)
     if request.method == "OPTIONS":
         return ("", 204)
 
-    # Lightweight token check (don't use @token_required so OPTIONS isn't blocked)
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"error": "Unauthorized"}), 401
-    token = auth.split(" ", 1)[1]
     try:
-        jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        return jsonify({"error": "Token expired"}), 401
-    except Exception:
-        return jsonify({"error": "Invalid token"}), 401
+        data = request.get_json(force=True) or {}
+        course = (data.get("course") or "").strip()
+        lab_id = (data.get("lab_id") or "").strip()
+        destroy = bool(data.get("destroy", True))
+        wait = bool(data.get("wait_for_destroy", False))
+        delete_state = bool(data.get("delete_state", False))
 
-    # Body
-    data = request.get_json(force=True) or {}
-    course = (data.get("course") or "").strip()
-    lab_id = (data.get("lab_id") or "").strip()
-    destroy = bool(data.get("destroy", True))
-    wait_for_destroy = bool(data.get("wait_for_destroy", False))
-    delete_state = bool(data.get("delete_state", False))
+        if not course or not lab_id:
+            return jsonify({"error": "course and lab_id are required"}), 400
 
-    if not course or not lab_id:
-        return jsonify({"error": "course and lab_id are required"}), 400
+        # Trigger destroy pipeline
+        destroy_status = None
+        pipeline_id = None
+        if destroy:
+            p = trigger_destroy_pipeline(course, lab_id)
+            pipeline_id = p.get("id")
+            if wait and pipeline_id:
+                destroy_status = wait_for_pipeline(GITLAB_PROJECT_ID, pipeline_id, timeout_s=1800, poll_s=8)
+            else:
+                destroy_status = "queued"
 
-    try:
-        # Call the helper you added in gitlab_utils
-        from gitlab_utils import delete_lab
+        # After destroy (or immediately), delete files from GitLab
+        mr = create_delete_lab_mr(course, lab_id=lab_id)
 
-        result = delete_lab(
-            course=course,
-            lab_id=lab_id,
-            destroy=destroy,
-            wait_for_destroy=wait_for_destroy,
-            delete_state=delete_state,
-        )
-        return jsonify(result), 200
+        # Delete tfstate blob (optional)
+        if delete_state:
+            try:
+                from gitlab_utils import _delete_state_blob_if_present
+                _delete_state_blob_if_present(course, lab_id)
+            except Exception as e:
+                print("[delete_lab] blob delete:", e)
+
+        return jsonify({
+            "status": "delete_requested",
+            "destroy": {"triggered": destroy, "pipeline_id": pipeline_id, "final_status": destroy_status},
+            "delete_mr": mr,
+        }), 200
+
     except Exception as e:
-        print("[api/labs/delete] Error:", e)
-        return jsonify({"error": "Failed to request lab deletion"}), 500
+        print("[/api/labs/delete] Error:", e)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.after_request
@@ -355,6 +360,18 @@ def add_cors_headers(resp):
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     return resp
+
+
+@app.route("/api/debug/azure", methods=["GET"])
+@token_required
+def debug_azure():
+    try:
+        from azure_client import debug_snapshot
+        snap = debug_snapshot(max_vms=15)
+        return jsonify(snap), 200
+    except Exception as e:
+        print("[/api/debug/azure] Error:", e)
+        return jsonify({"error": str(e)}), 500
 
 # ---------- Main ----------
 if __name__ == "__main__":
