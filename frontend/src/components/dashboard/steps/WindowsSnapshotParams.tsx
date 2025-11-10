@@ -4,7 +4,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
-import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectTrigger,
+  SelectContent,
+  SelectItem,
+  SelectValue,
+} from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
 import { Loader2, Plus, Trash2 } from "lucide-react";
 
@@ -15,13 +21,13 @@ type Disk = {
   disk_size_gb: number;
 };
 
-// ✅ Helper to remove `.tfstate` and any folder prefix
+// Remove trailing .tfstate and any leading folders
 const cleanLabName = (name: string) => {
   const last = (name || "").split("/").pop() || name;
   return last.replace(/\.tfstate$/i, "");
 };
 
-// ✅ Format "now + defaultMinutes" to local "YYYY-MM-DDTHH:mm" for <input type="datetime-local">
+// "now + N minutes" -> local YYYY-MM-DDTHH:mm for <input type="datetime-local">
 const defaultLocalDateTime = (defaultMinutesAhead = 120) => {
   const d = new Date(Date.now() + defaultMinutesAhead * 60 * 1000);
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -33,7 +39,7 @@ const defaultLocalDateTime = (defaultMinutesAhead = 120) => {
   return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
 };
 
-// ✅ Convert local datetime-local value to UTC ISO string (ends with Z)
+// local datetime to UTC ISO (Z)
 const localToUtcIso = (local: string): string | null => {
   if (!local) return null;
   const d = new Date(local);
@@ -48,7 +54,7 @@ export default function WindowsSnapshotParams({
   onDone,
 }: {
   course: string;
-  labName: string;
+  labName: string; // may include ".tfstate" for backend
   onBack: () => void;
   onDone: (r: any) => void;
 }) {
@@ -56,15 +62,18 @@ export default function WindowsSnapshotParams({
   const [loading, setLoading] = useState(false);
 
   const cleanedLab = cleanLabName(labName);
-  const [derivedVmName, setDerivedVmName] = useState(`Projects-${cleanedLab}-VM`);
+  const [derivedVmName, setDerivedVmName] = useState(
+    `Projects-${cleanedLab}-VM`
+  );
 
-useEffect(() => {
-  const formattedCourse = course.charAt(0).toUpperCase() + course.slice(1).toLowerCase();
-  const labBase = cleanLabName(labName);
-  const formattedLab = labBase.charAt(0).toUpperCase() + labBase.slice(1);
-  setDerivedVmName(`Projects-${formattedCourse}-${formattedLab}-VM`);
-}, [course, labName]);
-
+  // Derive a nice VM name using Course/Lab with capitalization
+  useEffect(() => {
+    const formattedCourse =
+      course.charAt(0).toUpperCase() + course.slice(1).toLowerCase();
+    const labBase = cleanLabName(labName);
+    const formattedLab = labBase.charAt(0).toUpperCase() + labBase.slice(1);
+    setDerivedVmName(`Projects-${formattedCourse}-${formattedLab}-VM`);
+  }, [course, labName]);
 
   // Form state
   const [vmCount, setVmCount] = useState<number>(1);
@@ -72,14 +81,15 @@ useEffect(() => {
   const [snapshotId, setSnapshotId] = useState("");
   const [disks, setDisks] = useState<Disk[]>([]);
 
-  // New: expiry (default 2 hours from now)
-  const [expiresLocal, setExpiresLocal] = useState<string>(defaultLocalDateTime(120));
+  // Expiry default: +2h
+  const [expiresLocal, setExpiresLocal] = useState<string>(
+    defaultLocalDateTime(120)
+  );
 
   const api = useMemo(() => {
     const i = axios.create({
       baseURL: "http://localhost:5000",
       headers: new AxiosHeaders({ "Content-Type": "application/json" }),
-      timeout: 20000,
     });
     i.interceptors.request.use((config) => {
       config.headers = AxiosHeaders.from(config.headers);
@@ -97,6 +107,7 @@ useEffect(() => {
     ]);
 
   const removeDisk = (idx: number) => setDisks((d) => d.filter((_, i) => i !== idx));
+
   const updateDisk = (idx: number, patch: Partial<Disk>) =>
     setDisks((d) => d.map((x, i) => (i === idx ? { ...x, ...patch } : x)));
 
@@ -132,9 +143,9 @@ useEffect(() => {
     try {
       const payload = {
         course,
-        lab_name: labName, // keep the full name with .tfstate for backend/backend.tf
+        lab_name: labName, // keep as-is for backend (may include .tfstate)
         module_name: "WindowsSnapshot",
-        expires_at: expiresIso, // 👈 send top-level expires_at (UTC ISO)
+        expires_at: expiresIso,
         params: {
           vm_count: vmCount,
           vm_size: vmSize,
@@ -145,25 +156,19 @@ useEffect(() => {
 
       const res = await api.post("/api/labs/create", payload);
 
-      toast({
-        title: "Terraform Lab Created",
-        description: res?.data?.merge_request_url ? (
-          <a
-            href={res.data.merge_request_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary underline"
-          >
-            View Merge Request in GitLab
-          </a>
-        ) : (
-          "Merge request created in GitLab."
-        ),
-      });
-
+      // Flip parent UI into the pending/Lottie view immediately
       onDone(res.data);
+
+      // Optional toast (non-blocking)
+      toast({
+        title: "Lab request submitted",
+        description: res?.data?.merge_request_url
+          ? "Merge Request opened in GitLab."
+          : "Request created successfully.",
+      });
     } catch (err: any) {
-      const msg = err?.response?.data?.error || err?.message || "Failed to create lab.";
+      const msg =
+        err?.response?.data?.error || err?.message || "Failed to create lab.";
       toast({ variant: "destructive", title: "Error", description: msg });
     } finally {
       setLoading(false);
@@ -209,7 +214,9 @@ useEffect(() => {
         <div className="space-y-2">
           <Label>VM Size *</Label>
           <Select value={vmSize} onValueChange={setVmSize}>
-            <SelectTrigger><SelectValue placeholder="Select size" /></SelectTrigger>
+            <SelectTrigger>
+              <SelectValue placeholder="Select size" />
+            </SelectTrigger>
             <SelectContent>
               <SelectItem value="Standard_D2s_v5">Standard_D2s_v5</SelectItem>
               <SelectItem value="Standard_D4s_v5">Standard_D4s_v5</SelectItem>
@@ -236,7 +243,7 @@ useEffect(() => {
             type="datetime-local"
             value={expiresLocal}
             onChange={(e) => setExpiresLocal(e.target.value)}
-            min={defaultLocalDateTime(1)} // prevent past selection
+            min={defaultLocalDateTime(1)}
           />
           <p className="text-xs text-muted-foreground">
             Pick the date & time this lab should expire (your local time). It will be stored in UTC.
@@ -259,10 +266,13 @@ useEffect(() => {
           <div className="space-y-3">
             {disks.map((d, i) => (
               <Card key={i} className="p-3">
-                <div className="grid grid-cols-1 sm-grid-cols-5 md:grid-cols-5 gap-2">
+                <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
                   <div className="space-y-1">
                     <Label>Name</Label>
-                    <Input value={d.name} onChange={(e) => updateDisk(i, { name: e.target.value })} />
+                    <Input
+                      value={d.name}
+                      onChange={(e) => updateDisk(i, { name: e.target.value })}
+                    />
                   </div>
                   <div className="space-y-1">
                     <Label>LUN</Label>
@@ -270,13 +280,20 @@ useEffect(() => {
                       type="number"
                       min={0}
                       value={d.lun}
-                      onChange={(e) => updateDisk(i, { lun: Number(e.target.value || 0) })}
+                      onChange={(e) =>
+                        updateDisk(i, { lun: Number(e.target.value || 0) })
+                      }
                     />
                   </div>
                   <div className="space-y-1">
                     <Label>Caching</Label>
-                    <Select value={d.caching} onValueChange={(v: any) => updateDisk(i, { caching: v })}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                    <Select
+                      value={d.caching}
+                      onValueChange={(v: any) => updateDisk(i, { caching: v })}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="ReadWrite">ReadWrite</SelectItem>
                         <SelectItem value="ReadOnly">ReadOnly</SelectItem>
@@ -290,7 +307,11 @@ useEffect(() => {
                       type="number"
                       min={1}
                       value={d.disk_size_gb}
-                      onChange={(e) => updateDisk(i, { disk_size_gb: Number(e.target.value || 0) })}
+                      onChange={(e) =>
+                        updateDisk(i, {
+                          disk_size_gb: Number(e.target.value || 0),
+                        })
+                      }
                     />
                   </div>
                   <div className="flex items-end">
@@ -311,7 +332,7 @@ useEffect(() => {
       </div>
 
       <div className="flex gap-3">
-        <Button type="button" variant="outline" onClick={onBack}>
+        <Button type="button" variant="outline" onClick={onBack} disabled={loading}>
           Previous
         </Button>
         <Button className="ml-auto" onClick={handleSubmit} disabled={loading}>
@@ -320,7 +341,7 @@ useEffect(() => {
               <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Creating…
             </>
           ) : (
-            "Create GitLab Request"
+            "Create Lab"
           )}
         </Button>
       </div>

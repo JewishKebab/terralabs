@@ -81,7 +81,6 @@ export default function RunningLabsPage() {
     const i = axios.create({
       baseURL: "http://localhost:5000",
       headers: new AxiosHeaders({ "Content-Type": "application/json" }),
-      timeout: 20000,
     });
     i.interceptors.request.use((config) => {
       config.headers = AxiosHeaders.from(config.headers);

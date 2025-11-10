@@ -8,6 +8,7 @@ import AuthPage from "./components/auth/AuthPage";
 import Dashboard from "./pages/Dashboard";
 import NotFound from "./pages/NotFound";
 import RunningLabsPage from "./pages/RunningLabs";
+import PendingApproval from "./pages/PendingApproval"; // 👈 import your new page
 
 const queryClient = new QueryClient();
 
@@ -21,9 +22,10 @@ const App = () => (
           <Route path="/" element={<Index />} />
           <Route path="/auth" element={<AuthPage />} />
           <Route path="/dashboard" element={<Dashboard />} />
-          {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
-          <Route path="*" element={<NotFound />} />
           <Route path="/labs" element={<RunningLabsPage />} />
+          <Route path="/pending-approval" element={<PendingApproval />} /> {/* 👈 add this */}
+          {/* Catch-all 404 last */}
+          <Route path="*" element={<NotFound />} />
         </Routes>
       </BrowserRouter>
     </TooltipProvider>

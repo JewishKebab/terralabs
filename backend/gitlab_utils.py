@@ -338,7 +338,7 @@ def create_delete_lab_mr(
     auto_approve: bool = True,         # try to approve MR before accepting
 ) -> Dict[str, Any]:
     """
-    Create a branch + MR that removes all files for the lab; ensure an MR pipeline exists;
+    Create a branch + MR that removes all files for the lab; ensure an **MR pipeline** exists;
     approve (optional); then queue auto-merge with the MR's head SHA.
     """
     actual_lab = _sanitize_lab_name(lab_name or lab_id or "")
@@ -431,7 +431,7 @@ def create_delete_lab_mr(
                 {"action": "create", "file_path": marker_path, "content": content}
             ])
 
-    # --- create MR (must NOT be draft/WIP) ---
+        # --- create MR (must NOT be draft/WIP) ---
     res = _gl_request(
         "POST",
         f"/projects/{GITLAB_PROJECT_ID}/merge_requests",
@@ -460,37 +460,107 @@ def create_delete_lab_mr(
         appr = _gl_request("POST", f"/projects/{GITLAB_PROJECT_ID}/merge_requests/{mr_iid}/approve")
         approval_result = {"status_code": appr.status_code, "text": appr.text[:400]}
 
-    # --- auto-merge: fetch head SHA, then accept with 'merge_when_pipeline_succeeds' and 'sha' ---
-    auto_merge_result = None
-    if auto_merge and mr_iid is not None:
-        # refresh MR to get head SHA (prefer diff_refs.head_sha, else sha)
-        mr_detail = _gl_request("GET", f"/projects/{GITLAB_PROJECT_ID}/merge_requests/{mr_iid}").json()
-        head_sha = (
-            (mr_detail.get("diff_refs") or {}).get("head_sha")
-            or mr_detail.get("sha")
-            or ""
+    # --- Ensure an MR pipeline exists (not just a branch pipeline) ---
+    mr_pipeline_create = None
+    if require_pipeline and mr_iid is not None:
+        mr_pipeline_create = _gl_request(
+            "POST",
+            f"/projects/{GITLAB_PROJECT_ID}/merge_requests/{mr_iid}/pipelines",
         )
 
-        # Optionally trigger a pipeline (usually MR pipeline is created automatically)
-        pipeline_hint = None
-        if require_pipeline:
-            trig = _gl_request("POST", f"/projects/{GITLAB_PROJECT_ID}/pipeline", json={"ref": branch})
-            pipeline_hint = {"status_code": trig.status_code, "text": trig.text[:200]}
+    # --- Robust auto-merge queueing with retries ---
+    def _get_mr(iid: int) -> Dict[str, Any]:
+        return _gl_request("GET", f"/projects/{GITLAB_PROJECT_ID}/merge_requests/{iid}").json()
 
-        accept = _gl_request(
+    def _accept_mr(iid: int, sha: str) -> requests.Response:
+        return _gl_request(
             "PUT",
-            f"/projects/{GITLAB_PROJECT_ID}/merge_requests/{mr_iid}/merge",
+            f"/projects/{GITLAB_PROJECT_ID}/merge_requests/{iid}/merge",
             data={
-                "sha": head_sha,                         # <-- important for some policies
-                "merge_when_pipeline_succeeds": True,    # queue auto-merge
+                "sha": sha,
+                "merge_when_pipeline_succeeds": True,
                 "should_remove_source_branch": True,
             },
         )
+
+    auto_merge_result = None
+    head_pipeline_id = None
+    auto_merge_queued = False
+    deadline = time.time() + 420  # 7 minutes max
+
+    while time.time() < deadline and mr_iid is not None and auto_merge:
+        detail = _get_mr(mr_iid)
+
+        # Quick policy checks: if these block, Accept won't latch.
+        if detail.get("work_in_progress") or detail.get("draft"):
+            # convert to non-draft by updating the title if you want; for now we just break
+            auto_merge_result = {"error": "MR is draft/WIP, cannot auto-merge yet"}
+            break
+        if detail.get("has_conflicts"):
+            auto_merge_result = {"error": "MR has conflicts"}
+            break
+
+        # Head pipeline presence/status
+        hp = detail.get("head_pipeline") or {}
+        head_pipeline_id = hp.get("id")
+        hp_status = hp.get("status")  # running, pending, success, failed, skipped, canceled
+
+        # Current head SHA we must pass to Accept
+        head_sha = (detail.get("diff_refs") or {}).get("head_sha") or detail.get("sha") or ""
+
+        detailed = detail.get("detailed_merge_status")  # e.g. can_be_merged, checks_failed, not_approved, discussions_not_resolved, pipeline_must_succeed
+        merge_status = detail.get("merge_status")
+
+        # If we don't have an MR pipeline yet, wait a bit and re-check.
+        if require_pipeline and not head_pipeline_id:
+            time.sleep(2.0)
+            continue
+
+        # Try to queue auto-merge (re-issue until it latches)
+        resp = _accept_mr(mr_iid, head_sha)
+        txt = resp.text[:400]
+        if resp.status_code in (200, 201):
+            # Either merged immediately (no required pipeline) or auto-merge queued
+            auto_merge_queued = True
+            auto_merge_result = {
+                "accept_status_code": resp.status_code,
+                "accept_text": txt,
+                "head_sha": head_sha,
+                "mr_head_pipeline_id": head_pipeline_id,
+                "mr_head_pipeline_status": hp_status,
+                "detailed_merge_status": detailed,
+                "merge_status": merge_status,
+            }
+            break
+
+        # GitLab often returns 406/405/409 with human text until conditions are met.
+        # Keep retrying while pipeline is running / pending OR merge gate says "pipeline_must_succeed" etc.
+        if resp.status_code in (405, 406, 409):
+            # If pipeline must succeed or is running, wait and retry.
+            if require_pipeline and hp_status in ("created", "pending", "running") or detailed in (
+                "pipeline_must_succeed", "checking", "not_approved",
+                "discussions_not_resolved", "ci_must_pass",
+            ):
+                time.sleep(3.0)
+                continue
+
+        # Any other status: record and break
         auto_merge_result = {
-            "accept_status_code": accept.status_code,
-            "accept_text": accept.text[:400],
+            "accept_status_code": resp.status_code,
+            "accept_text": txt,
             "head_sha": head_sha,
-            "pipeline_trigger": pipeline_hint,
+            "mr_head_pipeline_id": head_pipeline_id,
+            "mr_head_pipeline_status": hp_status,
+            "detailed_merge_status": detailed,
+            "merge_status": merge_status,
+        }
+        break
+
+    if auto_merge and not auto_merge_queued and auto_merge_result is None:
+        auto_merge_result = {
+            "accept_status_code": None,
+            "accept_text": "Timed out waiting to queue auto-merge",
+            "mr_head_pipeline_id": head_pipeline_id,
         }
 
     return {
@@ -503,7 +573,9 @@ def create_delete_lab_mr(
         "auto_approve": auto_approve,
         "approval_result": approval_result,
         "auto_merge_result": auto_merge_result,
+        "mr_pipeline_create_status": getattr(mr_pipeline_create, "status_code", None),
     }
+
 
 def delete_lab(
     course: str,
