@@ -19,12 +19,16 @@ GITLAB_API = f"{GITLAB_HOST}/api/v4"
 
 SESSION = requests.Session()
 SESSION.verify = REQUESTS_VERIFY
-SESSION.headers.update({"PRIVATE-TOKEN": GITLAB_TOKEN})
+if GITLAB_TOKEN:
+    SESSION.headers.update({"PRIVATE-TOKEN": GITLAB_TOKEN})
 
 TEMPLATES_ROOT = os.path.join(os.path.dirname(__file__), "templates")
 jinja = Environment(loader=FileSystemLoader(TEMPLATES_ROOT), autoescape=select_autoescape())
 jinja.filters["tojson"] = lambda value: json.dumps(value, indent=2)
 
+# -------------------------------------------------------------------
+# Optional: kept because you reference it in the UI
+# -------------------------------------------------------------------
 MODULE_SCHEMAS = {
     "WindowsSnapshot": {
         "title": "Windows VM from Snapshot",
@@ -51,6 +55,7 @@ MODULE_SCHEMAS = {
     }
 }
 
+# ---------------- small helpers ----------------
 def course_dir(course: str) -> str:
     c = (course or "").strip()
     return c[:1].upper() + c[1:].lower()
@@ -58,13 +63,19 @@ def course_dir(course: str) -> str:
 def _gl(path: str) -> str:
     return f"{GITLAB_API}{path}"
 
-# -------------------------------------------------------------------
-# Branch / Commit helpers (kept for CREATE flow)
-# -------------------------------------------------------------------
+def _normalize_lab(name: str) -> str:
+    """
+    Always use the plain Lab ID as the folder name (no .tfstate).
+    Strips trailing slashes and a trailing '.tfstate' suffix if present.
+    """
+    s = (name or "").strip().strip("/")
+    if s.lower().endswith(".tfstate"):
+        s = s[: -len(".tfstate")]
+    return s
+
+# ---------------- Branch / Commit helpers ----------------
 def ensure_branch(branch: str, base_branch: str = "main") -> bool:
-    """
-    Ensure branch exists. Returns True if it ALREADY existed, False if just created.
-    """
+    """Return True if branch existed, False if created."""
     r = SESSION.get(_gl(f"/projects/{GITLAB_PROJECT_ID}/repository/branches/{urllib.parse.quote(branch, safe='')}"))
     if r.status_code == 200:
         return True
@@ -77,11 +88,6 @@ def ensure_branch(branch: str, base_branch: str = "main") -> bool:
     return False
 
 def _commit_actions(branch: str, message: str, actions: list):
-    """
-    Commit actions to an EXISTING branch. We NEVER send start_branch here;
-    we call ensure_branch() first to create it when needed. This avoids the
-    GitLab 400 'branch already exists' error.
-    """
     payload = {
         "branch": branch,
         "commit_message": message,
@@ -92,9 +98,6 @@ def _commit_actions(branch: str, message: str, actions: list):
         raise RuntimeError(f"Commit failed: {r.status_code} {r.text}")
 
 def _find_open_mr_for_source_branch(source_branch: str) -> Optional[str]:
-    """
-    Return web_url of an OPEN MR for the given source_branch if any.
-    """
     params = {"source_branch": source_branch, "state": "opened"}
     r = SESSION.get(_gl(f"/projects/{GITLAB_PROJECT_ID}/merge_requests"), params=params)
     if r.status_code == 200:
@@ -103,7 +106,7 @@ def _find_open_mr_for_source_branch(source_branch: str) -> Optional[str]:
             return arr[0].get("web_url")
     return None
 
-def create_merge_request(source_branch: str, target_branch: str = "main", title: str = None):
+def create_merge_request(source_branch: str, target_branch: str = "main", title: Optional[str] = None) -> str:
     payload = {
         "source_branch": source_branch,
         "target_branch": target_branch,
@@ -113,65 +116,59 @@ def create_merge_request(source_branch: str, target_branch: str = "main", title:
     res = SESSION.post(_gl(f"/projects/{GITLAB_PROJECT_ID}/merge_requests"), data=payload)
     if res.status_code in (200, 201):
         return res.json().get("web_url")
-    # If an MR already exists, GitLab responds 409. Return that MR instead.
     if res.status_code == 409:
         url = _find_open_mr_for_source_branch(source_branch)
         if url:
             return url
     raise RuntimeError(f"Failed to create merge request: {res.status_code} {res.text}")
 
-# -------------------------------------------------------------------
-# Pipelines (optional, left as-is if you want to trigger CI externally)
-# -------------------------------------------------------------------
-def trigger_destroy_pipeline(course: str, lab_name: str) -> Dict[str, Any]:
-    payload = {
-        "ref": "main",
-        "variables": [
-            {"key": "TF_ACTION", "value": "destroy"},
-            {"key": "TLABS_COURSE", "value": course_dir(course)},
-            {"key": "TLABS_LAB", "value": lab_name},
-            {"key": "TRIGGER_REASON", "value": "api_delete"},
-        ]
-    }
-    r = SESSION.post(_gl(f"/projects/{GITLAB_PROJECT_ID}/pipeline"), json=payload)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"Failed to trigger destroy pipeline: {r.status_code} {r.text}")
-    return r.json()
+# ---------------- Repo tree helpers ----------------
+def _list_repo_tree(path: str, ref="main") -> List[Dict[str, Any]]:
+    out = []
+    page = 1
+    while True:
+        resp = SESSION.get(
+            _gl(f"/projects/{GITLAB_PROJECT_ID}/repository/tree"),
+            params={"ref": ref, "path": path, "recursive": True, "per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        items = resp.json()
+        out.extend(items)
+        if len(items) < 100:
+            break
+        page += 1
+    return out
 
-def get_pipeline(project_id: str, pipeline_id: int) -> Dict[str, Any]:
-    r = SESSION.get(_gl(f"/projects/{project_id}/pipelines/{pipeline_id}"))
-    r.raise_for_status()
-    return r.json()
+def _list_repo_tree_under(prefix: str, ref="main") -> List[Dict[str, Any]]:
+    out, page = [], 1
+    while True:
+        resp = SESSION.get(
+            _gl(f"/projects/{GITLAB_PROJECT_ID}/repository/tree"),
+            params={"ref": ref, "recursive": True, "per_page": 100, "page": page},
+        )
+        resp.raise_for_status()
+        items = resp.json()
+        out.extend(items)
+        if len(items) < 100:
+            break
+        page += 1
+    prefix = prefix.rstrip("/") + "/"
+    return [i for i in out if i.get("path", "").startswith(prefix)]
 
-def wait_for_pipeline(project_id: str, pipeline_id: int, timeout_s: int = 900, poll_s: int = 6) -> str:
-    deadline = time.time() + timeout_s
-    last_status = "unknown"
-    while time.time() < deadline:
-        try:
-            p = get_pipeline(project_id, pipeline_id)
-            status = p.get("status")
-            if status != last_status:
-                last_status = status
-            if status in ("success", "failed", "canceled", "skipped"):
-                return status
-        except Exception:
-            pass
-        time.sleep(poll_s)
-    return last_status
-
-# -------------------------------------------------------------------
-# Create lab (templates) — unchanged
-# -------------------------------------------------------------------
+# ---------------- Create lab (now plain folder name) ----------------
 def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: dict, base_branch="main"):
+    """
+    Create lab under Labs/<Course>/<LabId>/ (no .tfstate in folder name).
+    """
     if not (GITLAB_PROJECT_ID and GITLAB_TOKEN):
         raise RuntimeError("Missing GitLab configuration")
 
-    ctx = {"course": course, "lab_name": lab_name, "module_name": module_name, "tf_vars": params}
-
-    module_path = os.path.join(module_name)
+    lab_id = _normalize_lab(lab_name)
     course_folder = course_dir(course)
-    lab_folder = f"Labs/{course_folder}/{lab_name}"
-    branch_name = f"labs/{course_folder}/{lab_name}".replace(" ", "-").lower()
+    lab_folder = f"Labs/{course_folder}/{lab_id}"
+    branch_name = f"labs/{course_folder}/{lab_id}".replace(" ", "-").lower()
+
+    ctx = {"course": course, "lab_name": lab_id, "module_name": module_name, "tf_vars": params}
 
     ensure_branch(branch_name, base_branch)
 
@@ -181,27 +178,83 @@ def create_lab_in_gitlab(course: str, lab_name: str, module_name: str, params: d
         return tmpl.render(**context)
 
     files = {
-        f"{lab_folder}/.gitlab-ci.yml": render_from(module_path, ".gitlab-ci.yml", ctx),
-        f"{lab_folder}/azurerm-provider-variables.tf": render_from(module_path, "azurerm-provider-variables.tf", ctx),
-        f"{lab_folder}/backend.tf": render_from(module_path, "backend.tf.j2", ctx),
-        f"{lab_folder}/main.tf": render_from(module_path, "main.tf", ctx),
-        f"{lab_folder}/provider.tf": render_from(module_path, "provider.tf", ctx),
-        f"{lab_folder}/variables.tf": render_from(module_path, "variables.tf", ctx),
-        f"{lab_folder}/terraform.tfvars": render_from(module_path, "terraform.tfvars.j2", ctx),
+        f"{lab_folder}/.gitlab-ci.yml": render_from(module_name, ".gitlab-ci.yml", ctx),
+        f"{lab_folder}/azurerm-provider-variables.tf": render_from(module_name, "azurerm-provider-variables.tf", ctx),
+        f"{lab_folder}/backend.tf": render_from(module_name, "backend.tf.j2", ctx),
+        f"{lab_folder}/main.tf": render_from(module_name, "main.tf", ctx),
+        f"{lab_folder}/provider.tf": render_from(module_name, "provider.tf", ctx),
+        f"{lab_folder}/variables.tf": render_from(module_name, "variables.tf", ctx),
+        f"{lab_folder}/terraform.tfvars": render_from(module_name, "terraform.tfvars.j2", ctx),
     }
 
     for path, content in files.items():
-        _commit_actions(branch_name, f"[TerraLabs] Create {course_folder}/{lab_name}", [
+        _commit_actions(branch_name, f"[TerraLabs] Create {course_folder}/{lab_id}", [
             {"action": "create", "file_path": path, "content": content}
         ])
 
-    mr_url = create_merge_request(branch_name, base_branch, f"[TerraLabs] {course_folder}/{lab_name}")
+    mr_url = create_merge_request(branch_name, base_branch, f"[TerraLabs] {course_folder}/{lab_id}")
     return {"lab_folder": lab_folder, "branch": branch_name, "merge_request_url": mr_url}
 
-# -------------------------------------------------------------------
-# Optional tfstate cleanup helper
-# -------------------------------------------------------------------
+# ---------------- Delete lab (MR removing folder; supports legacy) ----------------
+def create_delete_lab_mr(
+    course: str,
+    lab_name: Optional[str] = None,
+    *,
+    lab_id: Optional[str] = None,
+    base_branch: str = "main",
+) -> Dict[str, Any]:
+    """
+    Create a branch + MR that deletes all files for a lab under Labs/<Course>/<LabId>/.
+    Also removes legacy locations:
+      - Labs/<Course>/<LabId>.tfstate/
+      - Labs/<Course>/<LabId>.tfstate
+    """
+    if not (GITLAB_PROJECT_ID and GITLAB_TOKEN):
+        raise RuntimeError("Missing GitLab configuration")
+
+    actual_lab = _normalize_lab(lab_name or lab_id or "")
+    if not actual_lab:
+        raise ValueError("create_delete_lab_mr: require lab_name or lab_id")
+
+    course_folder = course_dir(course)
+    base_prefix = f"Labs/{course_folder}"
+    # Pull everything under the course folder and filter ourselves
+    tree = _list_repo_tree(base_prefix, ref=base_branch) or _list_repo_tree_under(base_prefix, ref=base_branch)
+
+    # Primary (new) folder
+    prefix_primary = f"{base_prefix}/{actual_lab}/"
+    # Legacy shapes
+    prefix_legacy = f"{base_prefix}/{actual_lab}.tfstate/"
+    exact_legacy_file = f"{base_prefix}/{actual_lab}.tfstate"
+
+    files: List[str] = []
+    for item in tree:
+        if item.get("type") != "blob":
+            continue
+        path = item.get("path") or ""
+        if path.startswith(prefix_primary) or path.startswith(prefix_legacy) or path == exact_legacy_file:
+            files.append(path)
+
+    branch = f"tlabs/delete-{course_folder}-{actual_lab}".replace(" ", "-").lower()
+    ensure_branch(branch, base_branch)
+
+    if files:
+        actions = [{"action": "delete", "file_path": p} for p in sorted(set(files))]
+        message = f"[TerraLabs] Remove {course_folder}/{actual_lab}"
+        _commit_actions(branch, message, actions)
+    else:
+        _commit_actions(branch, f"[TerraLabs] Remove {course_folder}/{actual_lab} (no files found)", [])
+
+    mr_title = f"[TerraLabs] Delete lab {course_folder}/{actual_lab}"
+    mr_url = create_merge_request(branch, base_branch, mr_title)
+    return {"branch": branch, "merge_request_url": mr_url, "lab_folder_base": base_prefix}
+
+# ---------------- Optional tfstate cleanup helper ----------------
 def _delete_state_blob_if_present(course: str, lab_name: str) -> bool:
+    """
+    If you still store .tfstate blobs in Azure Storage, this removes common locations.
+    Not used by Git, but kept here for your /api flow.
+    """
     try:
         from azure.storage.blob import BlobServiceClient
         acct = os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
@@ -215,10 +268,12 @@ def _delete_state_blob_if_present(course: str, lab_name: str) -> bool:
             credential=key,
         )
         container_client = blob_service.get_container_client(container)
+
+        lab_id = _normalize_lab(lab_name)
         candidates = [
-            f"{course_dir(course)}/{lab_name}.tfstate",
-            f"{lab_name}.tfstate",
-            f"Labs/{course_dir(course)}/{lab_name}.tfstate",
+            f"{course_dir(course)}/{lab_id}.tfstate",                      # legacy flat
+            f"Labs/{course_dir(course)}/{lab_id}.tfstate",                 # legacy under Labs
+            f"Labs/{course_dir(course)}/{lab_id}/{lab_id}.tfstate",        # if someone wrote it inside the new folder
         ]
         done = False
         for blob_name in candidates:
@@ -231,34 +286,34 @@ def _delete_state_blob_if_present(course: str, lab_name: str) -> bool:
     except Exception:
         return False
 
-# -------------------------------------------------------------------
-# High-level delete flow (Azure ➜ optional tfstate) — NO MR CREATION
-# -------------------------------------------------------------------
+# ---------------- High-level delete flow (Azure ➜ MR ➜ tfstate) ----------------
 def delete_lab(
     course: str,
     *,
     lab_id: str,
     azure_dry_run: bool = False,
-    wait_for_azure: bool = True,  # kept for API compatibility; deletion is synchronous in our SDK call
+    wait_for_azure: bool = True,
     delete_state: bool = True,
 ) -> Dict[str, Any]:
     """
-    Delete Azure resources by tags and (optionally) delete the tfstate blob.
-    This version DOES NOT create a merge request or touch the Git repo for deletions.
+    Delete Azure resources by tags AND open an MR that removes the lab folder.
+    Also optionally deletes tfstate blob(s) if present.
     """
+    if not (GITLAB_PROJECT_ID and GITLAB_TOKEN):
+        raise RuntimeError("Missing GitLab configuration")
+
     from azure_client import delete_lab_resources  # lazy import to avoid cycles
 
     course_folder = course_dir(course)
-
-    # 1) Azure deletion via SDK (synchronous)
     azure_summary = delete_lab_resources(lab_id=lab_id, course=course_folder, dry_run=azure_dry_run)
+    mr = create_delete_lab_mr(course, lab_id=lab_id)
 
-    # 2) Optionally delete tfstate blob
     state_deleted = False
     if delete_state and not azure_dry_run:
         state_deleted = _delete_state_blob_if_present(course, lab_id)
 
     return {
         "azure": azure_summary,
+        "delete_mr": mr,
         "tfstate_deleted": state_deleted,
     }

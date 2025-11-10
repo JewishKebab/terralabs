@@ -1,7 +1,7 @@
 # backend/azure_client.py
 import os
 import time
-from typing import Dict, List, Any, Optional, Tuple, Set
+from typing import Dict, List, Any, Optional, Tuple
 
 from azure.identity import (
     DefaultAzureCredential,
@@ -11,7 +11,9 @@ from azure.identity import (
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
 
-# ---------------- Tag keys & RG scope ----------------
+# ---------------- Config / Tag keys & RG scope ----------------
+TARGET_RESOURCE_GROUP = "Projects-TerraLabs-RG"  # <— only this RG for debug + delete
+
 TAG_KEYS_LAB_ID = [
     os.environ.get("TL_TAG_LAB_ID_KEY") or "LabId",
     "lab_id", "LabID", "labId", "TLABS_LAB", "TLABS_LAB_ID",
@@ -22,6 +24,9 @@ TAG_KEYS_COURSE = [
 ]
 TAG_KEYS_CREATED_AT = ["CreatedAt", "CreatedOnDate", "created_at"]
 TAG_KEYS_EXPIRES_AT = ["ExpiresAt", "expires_at"]
+
+# Optional RG prefix filter for discovery helpers;
+# NOTE: deletion & debug below are hard-scoped to TARGET_RESOURCE_GROUP.
 RG_PREFIX = os.environ.get("TL_RG_PREFIX") or ""
 
 # ---------------- Clients ----------------
@@ -76,6 +81,7 @@ def _network() -> NetworkManagementClient:
     _ensure_clients()
     assert _NETWORK is not None
     return _NETWORK
+
 
 # ---------------- Utilities ----------------
 def _parse_resource_id(resource_id: str) -> Dict[str, str]:
@@ -176,7 +182,8 @@ def _rg_is_allowed(resource_group: Optional[str]) -> bool:
         return True
     return (resource_group or "").startswith(RG_PREFIX)
 
-# ---------------- Discovery (existing functions) ----------------
+
+# ---------------- Discovery ----------------
 def list_vms_in_lab(lab_id: str, course: Optional[str] = None) -> List[Dict[str, Any]]:
     _ensure_clients()
     out: List[Dict[str, Any]] = []
@@ -243,7 +250,8 @@ def list_running_labs() -> List[Dict[str, Any]]:
     labs.sort(key=lambda x: (x["course"], x["lab_id"]))
     return labs
 
-# ---------------- Power ops (existing) ----------------
+
+# ---------------- Power ops ----------------
 def start_vm_by_id(vm_id: str) -> str:
     _ensure_clients()
     rid = _parse_resource_id(vm_id)
@@ -269,31 +277,35 @@ def stop_vm_by_id(vm_id: str, deallocate: bool = True) -> str:
         _compute().virtual_machines.begin_power_off(rg, name)
         return "poweroff_requested"
 
-# ---------------- NEW: deletion by tags ----------------
-def _match_tags(tags: Dict[str, str], lab_id: str, course: Optional[str]) -> bool:
+
+# ---------------- Delete by tags (scoped to TARGET_RESOURCE_GROUP) ----------------
+def _both_tags_match(tags: Dict[str, str], lab_id: str, course: str) -> bool:
+    """Case-insensitive match on BOTH LabId and LabCourse values."""
     if not tags:
         return False
-    lab_match = _get_tag(tags, TAG_KEYS_LAB_ID) == lab_id
-    if not lab_match:
-        return False
-    if course:
-        course_match = _get_tag(tags, TAG_KEYS_COURSE) == course
-        return course_match
-    return True
+    val_lab = (_get_tag(tags, TAG_KEYS_LAB_ID) or "").strip().lower()
+    val_course = (_get_tag(tags, TAG_KEYS_COURSE) or "").strip().lower()
+    return val_lab == lab_id.strip().lower() and val_course == course.strip().lower()
 
 
 def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
     """
-    Deletes all major resources that carry the lab tags:
+    Deletes resources ONLY in TARGET_RESOURCE_GROUP that carry BOTH tags:
+      - LabId == lab_id
+      - LabCourse == course (required)
+    Resource types:
       - Virtual Machines (with force_deletion=True)
       - NICs
       - Public IPs
-      - Managed Disks (including explicit deletion of each VM's OS/data disks)
+      - Managed Disks
     Returns a summary of what was targeted/deleted.
     """
     _ensure_clients()
-    course = course or ""
+    if not course:
+        raise ValueError("delete_lab_resources: 'course' is required for strict two-tag match")
+
     summary = {
+        "target_rg": TARGET_RESOURCE_GROUP,
         "lab_id": lab_id,
         "course": course,
         "dry_run": dry_run,
@@ -303,162 +315,64 @@ def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: 
         "disks": {"matched": [], "deleted": []},
     }
 
-    # Track disks we explicitly delete during VM cleanup to avoid double-delete later
-    disks_deleted: Set[Tuple[str, str]] = set()  # (rg, disk_name)
-
     # ---------- 1) VMs ----------
-    vms = list(_compute().virtual_machines.list_all())
-    for vm in vms:
-        rid = _parse_resource_id(vm.id)
-        rg = rid.get("resourceGroups")
-        if not _rg_is_allowed(rg):
-            continue
+    for vm in _compute().virtual_machines.list(TARGET_RESOURCE_GROUP):
         tags = getattr(vm, "tags", {}) or {}
-        if not _match_tags(tags, lab_id, course or None):
+        if not _both_tags_match(tags, lab_id, course):
             continue
-
-        # Collect attached disk references up-front (before VM is deleted)
-        os_disk_rg_name: Optional[Tuple[str, Optional[str]]] = None
-        data_disks_rg_names: List[Tuple[str, Optional[str]]] = []
-
-        try:
-            sp = getattr(vm, "storage_profile", None)
-            if sp:
-                # OS disk
-                osd = getattr(sp, "os_disk", None)
-                if osd:
-                    md = getattr(osd, "managed_disk", None)
-                    did = getattr(md, "id", None)
-                    if did:
-                        drid = _parse_resource_id(did)
-                        os_disk_rg_name = (drid.get("resourceGroups") or rg, drid.get("disks"))
-                    else:
-                        os_disk_rg_name = (rg, getattr(osd, "name", None))
-
-                # Data disks
-                for dd in getattr(sp, "data_disks", []) or []:
-                    md = getattr(dd, "managed_disk", None)
-                    did = getattr(md, "id", None)
-                    if did:
-                        drid = _parse_resource_id(did)
-                        data_disks_rg_names.append((drid.get("resourceGroups") or rg, drid.get("disks")))
-                    else:
-                        data_disks_rg_names.append((rg, getattr(dd, "name", None)))
-        except Exception:
-            # Best-effort; continue even if we can't enumerate disks
-            pass
-
-        summary["vms"]["matched"].append({"rg": rg, "name": vm.name})
+        summary["vms"]["matched"].append({"rg": TARGET_RESOURCE_GROUP, "name": vm.name})
         if not dry_run:
-            # (1) Delete VM with force
-            poller = _compute().virtual_machines.begin_delete(rg, vm.name, force_deletion=True)
+            poller = _compute().virtual_machines.begin_delete(TARGET_RESOURCE_GROUP, vm.name, force_deletion=True)
             poller.result()
-            summary["vms"]["deleted"].append({"rg": rg, "name": vm.name})
-
-            # (2) Explicitly delete attached disks (OS + data)
-            # OS disk
-            if os_disk_rg_name and os_disk_rg_name[1]:
-                d_rg, d_name = os_disk_rg_name
-                try:
-                    summary["disks"]["matched"].append({"rg": d_rg, "name": d_name})
-                    d_poller = _compute().disks.begin_delete(d_rg, d_name)
-                    d_poller.result()
-                    summary["disks"]["deleted"].append({"rg": d_rg, "name": d_name})
-                    disks_deleted.add((d_rg, d_name))
-                except Exception:
-                    # Ignore failures so the sweep below can retry if needed
-                    pass
-
-            # Data disks
-            for d_rg, d_name in data_disks_rg_names:
-                if not d_name:
-                    continue
-                try:
-                    summary["disks"]["matched"].append({"rg": d_rg, "name": d_name})
-                    d_poller = _compute().disks.begin_delete(d_rg, d_name)
-                    d_poller.result()
-                    summary["disks"]["deleted"].append({"rg": d_rg, "name": d_name})
-                    disks_deleted.add((d_rg, d_name))
-                except Exception:
-                    pass
+            summary["vms"]["deleted"].append({"rg": TARGET_RESOURCE_GROUP, "name": vm.name})
 
     # ---------- 2) NICs ----------
-    nics = list(_network().network_interfaces.list_all())
-    for nic in nics:
-        rid = _parse_resource_id(nic.id)
-        rg = rid.get("resourceGroups")
-        name = rid.get("networkInterfaces")
-        if not _rg_is_allowed(rg):
-            continue
+    for nic in _network().network_interfaces.list(TARGET_RESOURCE_GROUP):
         tags = getattr(nic, "tags", {}) or {}
-        if not _match_tags(tags, lab_id, course or None):
+        if not _both_tags_match(tags, lab_id, course):
             continue
-        summary["nics"]["matched"].append({"rg": rg, "name": name})
+        summary["nics"]["matched"].append({"rg": TARGET_RESOURCE_GROUP, "name": nic.name})
         if not dry_run:
-            poller = _network().network_interfaces.begin_delete(rg, name)
+            poller = _network().network_interfaces.begin_delete(TARGET_RESOURCE_GROUP, nic.name)
             poller.result()
-            summary["nics"]["deleted"].append({"rg": rg, "name": name})
+            summary["nics"]["deleted"].append({"rg": TARGET_RESOURCE_GROUP, "name": nic.name})
 
     # ---------- 3) Public IPs ----------
-    pips = list(_network().public_ip_addresses.list_all())
-    for pip in pips:
-        rid = _parse_resource_id(pip.id)
-        rg = rid.get("resourceGroups")
-        name = rid.get("publicIPAddresses")
-        if not _rg_is_allowed(rg):
-            continue
+    for pip in _network().public_ip_addresses.list(TARGET_RESOURCE_GROUP):
         tags = getattr(pip, "tags", {}) or {}
-        if not _match_tags(tags, lab_id, course or None):
+        if not _both_tags_match(tags, lab_id, course):
             continue
-        summary["public_ips"]["matched"].append({"rg": rg, "name": name})
+        summary["public_ips"]["matched"].append({"rg": TARGET_RESOURCE_GROUP, "name": pip.name})
         if not dry_run:
-            poller = _network().public_ip_addresses.begin_delete(rg, name)
+            poller = _network().public_ip_addresses.begin_delete(TARGET_RESOURCE_GROUP, pip.name)
             poller.result()
-            summary["public_ips"]["deleted"].append({"rg": rg, "name": name})
+            summary["public_ips"]["deleted"].append({"rg": TARGET_RESOURCE_GROUP, "name": pip.name})
 
     # ---------- 4) Disks ----------
-    disks = list(_compute().disks.list())
-    for disk in disks:
-        rid = _parse_resource_id(disk.id)
-        rg = rid.get("resourceGroups")
-        name = rid.get("disks")
-        if not _rg_is_allowed(rg):
-            continue
-        if (rg, name) in disks_deleted:
-            # already deleted as part of VM cleanup
-            continue
+    for disk in _compute().disks.list_by_resource_group(TARGET_RESOURCE_GROUP):
         tags = getattr(disk, "tags", {}) or {}
-        if not _match_tags(tags, lab_id, course or None):
+        if not _both_tags_match(tags, lab_id, course):
             continue
-        summary["disks"]["matched"].append({"rg": rg, "name": name})
+        summary["disks"]["matched"].append({"rg": TARGET_RESOURCE_GROUP, "name": disk.name})
         if not dry_run:
-            poller = _compute().disks.begin_delete(rg, name)
+            poller = _compute().disks.begin_delete(TARGET_RESOURCE_GROUP, disk.name)
             poller.result()
-            summary["disks"]["deleted"].append({"rg": rg, "name": name})
+            summary["disks"]["deleted"].append({"rg": TARGET_RESOURCE_GROUP, "name": disk.name})
 
     return summary
 
-# --- DEBUG helpers ------------------------------------------------------------
-def _identity_mode() -> str:
-    if (os.environ.get("TL_USE_AZCLI") or "").lower() in ("1", "true", "yes"):
-        return "AzureCliCredential"
-    tenant = os.environ.get("AZURE_TENANT_ID")
-    client = os.environ.get("AZURE_CLIENT_ID")
-    secret = os.environ.get("AZURE_CLIENT_SECRET")
-    if tenant and client and secret:
-        return "ClientSecretCredential"
-    return "DefaultAzureCredential"
 
-def debug_snapshot(max_vms: int = 10):
+# --- DEBUG: ONLY target RG ----------------------------------------------------
+def debug_snapshot(max_vms: int = 20):
+    """
+    Show a summary of resources ONLY in the TARGET_RESOURCE_GROUP.
+    Lists VMs and their important tag keys so you can verify matching logic.
+    """
     _ensure_clients()
+    rg = TARGET_RESOURCE_GROUP
+    vms = list(_compute().virtual_machines.list(rg))
     sample = []
-    total = 0
-    from itertools import islice
-    vms_iter = list(_compute().virtual_machines.list_all())
-    total = len(vms_iter)
-    for vm in islice(vms_iter, 0, max_vms):
-        rid = _parse_resource_id(vm.id)
-        rg = rid.get("resourceGroups")
+    for vm in vms[:max_vms]:
         tags = getattr(vm, "tags", {}) or {}
         sample.append({
             "name": vm.name,
@@ -471,17 +385,17 @@ def debug_snapshot(max_vms: int = 10):
                 "TLABS_LAB": tags.get("TLABS_LAB"),
                 "LabCourse": tags.get("LabCourse"),
                 "course": tags.get("course"),
+                "TLABS_COURSE": tags.get("TLABS_COURSE"),
                 "CreatedAt": tags.get("CreatedAt") or tags.get("CreatedOnDate"),
                 "ExpiresAt": tags.get("ExpiresAt"),
             }
         })
     return {
-        "identity_mode": _identity_mode(),
-        "subscription_id": _SUBSCRIPTION_ID,
-        "vm_total_seen": total,
-        "rg_prefix_filter": os.environ.get("TL_RG_PREFIX") or "",
+        "resource_group": rg,
+        "vm_count": len(vms),
         "sample": sample,
     }
+
 
 __all__ = [
     "list_vms_in_lab",
