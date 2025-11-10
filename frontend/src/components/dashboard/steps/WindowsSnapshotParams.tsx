@@ -1,18 +1,13 @@
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import axios, { AxiosHeaders } from "axios";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card } from "@/components/ui/card";
-import {
-  Select,
-  SelectTrigger,
-  SelectContent,
-  SelectItem,
-  SelectValue,
-} from "@/components/ui/select";
+import { Select, SelectTrigger, SelectContent, SelectItem, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import { Loader2, Plus, Trash2 } from "lucide-react";
+import { Loader2, Plus, Trash2, Search, RefreshCw, CheckCircle2 } from "lucide-react";
 
 type Disk = {
   name: string;
@@ -21,13 +16,21 @@ type Disk = {
   disk_size_gb: number;
 };
 
-// Remove trailing .tfstate and any leading folders
+type SnapshotItem = {
+  name: string;
+  id: string;
+  time_created?: string | null;
+  sku?: string | null;
+  provisioning_state?: string | null;
+};
+
+// ✅ Helper to remove `.tfstate` and any folder prefix
 const cleanLabName = (name: string) => {
   const last = (name || "").split("/").pop() || name;
   return last.replace(/\.tfstate$/i, "");
 };
 
-// "now + N minutes" -> local YYYY-MM-DDTHH:mm for <input type="datetime-local">
+// ✅ Format "now + defaultMinutes" to local "YYYY-MM-DDTHH:mm" for <input type="datetime-local">
 const defaultLocalDateTime = (defaultMinutesAhead = 120) => {
   const d = new Date(Date.now() + defaultMinutesAhead * 60 * 1000);
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -39,13 +42,25 @@ const defaultLocalDateTime = (defaultMinutesAhead = 120) => {
   return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
 };
 
-// local datetime to UTC ISO (Z)
+// ✅ Convert local datetime-local value to UTC ISO string (ends with Z)
 const localToUtcIso = (local: string): string | null => {
   if (!local) return null;
   const d = new Date(local);
   if (isNaN(d.getTime())) return null;
   return d.toISOString();
 };
+
+const API_BASE = "http://localhost:5000";
+
+// small helper for debouncing searches
+function useDebouncedValue<T>(value: T, delay = 300) {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setV(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return v;
+}
 
 export default function WindowsSnapshotParams({
   course,
@@ -54,7 +69,7 @@ export default function WindowsSnapshotParams({
   onDone,
 }: {
   course: string;
-  labName: string; // may include ".tfstate" for backend
+  labName: string; // includes .tfstate for backend paths
   onBack: () => void;
   onDone: (r: any) => void;
 }) {
@@ -62,14 +77,10 @@ export default function WindowsSnapshotParams({
   const [loading, setLoading] = useState(false);
 
   const cleanedLab = cleanLabName(labName);
-  const [derivedVmName, setDerivedVmName] = useState(
-    `Projects-${cleanedLab}-VM`
-  );
+  const [derivedVmName, setDerivedVmName] = useState(`Projects-${cleanedLab}-VM`);
 
-  // Derive a nice VM name using Course/Lab with capitalization
   useEffect(() => {
-    const formattedCourse =
-      course.charAt(0).toUpperCase() + course.slice(1).toLowerCase();
+    const formattedCourse = course.charAt(0).toUpperCase() + course.slice(1).toLowerCase();
     const labBase = cleanLabName(labName);
     const formattedLab = labBase.charAt(0).toUpperCase() + labBase.slice(1);
     setDerivedVmName(`Projects-${formattedCourse}-${formattedLab}-VM`);
@@ -78,18 +89,25 @@ export default function WindowsSnapshotParams({
   // Form state
   const [vmCount, setVmCount] = useState<number>(1);
   const [vmSize, setVmSize] = useState("Standard_D2s_v5");
-  const [snapshotId, setSnapshotId] = useState("");
+
+  // ⬇️ Snapshot picker state (name search ➜ choose one ➜ we keep its ID)
+  const [snapQuery, setSnapQuery] = useState("");
+  const debouncedQuery = useDebouncedValue(snapQuery, 300);
+  const [snapLoading, setSnapLoading] = useState(false);
+  const [snapshots, setSnapshots] = useState<SnapshotItem[]>([]);
+  const [selectedSnapshot, setSelectedSnapshot] = useState<SnapshotItem | null>(null);
+
+  // Optional extra disks
   const [disks, setDisks] = useState<Disk[]>([]);
 
-  // Expiry default: +2h
-  const [expiresLocal, setExpiresLocal] = useState<string>(
-    defaultLocalDateTime(120)
-  );
+  // New: expiry (default 2 hours from now)
+  const [expiresLocal, setExpiresLocal] = useState<string>(defaultLocalDateTime(120));
 
   const api = useMemo(() => {
     const i = axios.create({
-      baseURL: "http://localhost:5000",
+      baseURL: API_BASE,
       headers: new AxiosHeaders({ "Content-Type": "application/json" }),
+      timeout: 0, // allow long calls
     });
     i.interceptors.request.use((config) => {
       config.headers = AxiosHeaders.from(config.headers);
@@ -107,16 +125,51 @@ export default function WindowsSnapshotParams({
     ]);
 
   const removeDisk = (idx: number) => setDisks((d) => d.filter((_, i) => i !== idx));
-
   const updateDisk = (idx: number, patch: Partial<Disk>) =>
     setDisks((d) => d.map((x, i) => (i === idx ? { ...x, ...patch } : x)));
 
+  // --- Snapshot fetcher ---
+  const fetchSnapshots = async (q: string) => {
+    setSnapLoading(true);
+    try {
+      const res = await api.get("/api/snapshots", { params: q ? { q } : {} });
+      const items: SnapshotItem[] = (res.data?.snapshots ?? []).map((s: any) => ({
+        name: s.name,
+        id: s.id,
+        time_created: s.time_created,
+        sku: s.sku,
+        provisioning_state: s.provisioning_state,
+      }));
+      setSnapshots(items);
+    } catch (e: any) {
+      toast({
+        variant: "destructive",
+        title: "Failed to load snapshots",
+        description: e?.response?.data?.error || e?.message,
+      });
+    } finally {
+      setSnapLoading(false);
+    }
+  };
+
+  // initial load of latest snapshots
+  useEffect(() => {
+    fetchSnapshots("");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // re-fetch when query changes
+  useEffect(() => {
+    fetchSnapshots(debouncedQuery);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery]);
+
   const handleSubmit = async () => {
-    if (!snapshotId || !vmSize || vmCount <= 0) {
+    if (!selectedSnapshot?.id || !vmSize || vmCount <= 0) {
       toast({
         variant: "destructive",
         title: "Missing fields",
-        description: "Fill all required fields.",
+        description: !selectedSnapshot?.id ? "Please select a snapshot." : "Fill all required fields.",
       });
       return;
     }
@@ -143,32 +196,38 @@ export default function WindowsSnapshotParams({
     try {
       const payload = {
         course,
-        lab_name: labName, // keep as-is for backend (may include .tfstate)
+        lab_name: labName, // keep the full name with .tfstate for backend/backend.tf
         module_name: "WindowsSnapshot",
-        expires_at: expiresIso,
+        expires_at: expiresIso, // 👈 top-level (UTC ISO)
         params: {
           vm_count: vmCount,
           vm_size: vmSize,
-          snapshot_id: snapshotId,
+          snapshot_id: selectedSnapshot.id, // 👈 from picker
           data_disks: disks,
         },
       };
 
       const res = await api.post("/api/labs/create", payload);
 
-      // Flip parent UI into the pending/Lottie view immediately
-      onDone(res.data);
-
-      // Optional toast (non-blocking)
       toast({
-        title: "Lab request submitted",
-        description: res?.data?.merge_request_url
-          ? "Merge Request opened in GitLab."
-          : "Request created successfully.",
+        title: "Terraform Lab Created",
+        description: res?.data?.merge_request_url ? (
+          <a
+            href={res.data.merge_request_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-primary underline"
+          >
+            View Merge Request in GitLab
+          </a>
+        ) : (
+          "Merge request created in GitLab."
+        ),
       });
+
+      onDone(res.data);
     } catch (err: any) {
-      const msg =
-        err?.response?.data?.error || err?.message || "Failed to create lab.";
+      const msg = err?.response?.data?.error || err?.message || "Failed to create lab.";
       toast({ variant: "destructive", title: "Error", description: msg });
     } finally {
       setLoading(false);
@@ -214,9 +273,7 @@ export default function WindowsSnapshotParams({
         <div className="space-y-2">
           <Label>VM Size *</Label>
           <Select value={vmSize} onValueChange={setVmSize}>
-            <SelectTrigger>
-              <SelectValue placeholder="Select size" />
-            </SelectTrigger>
+            <SelectTrigger><SelectValue placeholder="Select size" /></SelectTrigger>
             <SelectContent>
               <SelectItem value="Standard_D2s_v5">Standard_D2s_v5</SelectItem>
               <SelectItem value="Standard_D4s_v5">Standard_D4s_v5</SelectItem>
@@ -226,14 +283,72 @@ export default function WindowsSnapshotParams({
           </Select>
         </div>
 
-        {/* Snapshot ID */}
+        {/* Snapshot Picker */}
         <div className="md:col-span-2 space-y-2">
-          <Label>OS Snapshot Resource ID *</Label>
-          <Input
-            placeholder="/subscriptions/.../resourceGroups/.../providers/Microsoft.Compute/snapshots/..."
-            value={snapshotId}
-            onChange={(e) => setSnapshotId(e.target.value)}
-          />
+          <Label>Choose Snapshot *</Label>
+
+          <div className="flex items-center gap-2">
+            <div className="relative flex-1">
+              <Search className="h-4 w-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                className="pl-9"
+                placeholder="Search snapshots (by name)…"
+                value={snapQuery}
+                onChange={(e) => setSnapQuery(e.target.value)}
+              />
+            </div>
+            <Button variant="outline" type="button" onClick={() => fetchSnapshots(debouncedQuery)} disabled={snapLoading}>
+              <RefreshCw className={`h-4 w-4 ${snapLoading ? "animate-spin" : ""}`} />
+            </Button>
+          </div>
+
+          <div className="border rounded-md max-h-56 overflow-auto mt-2">
+            {snapLoading ? (
+              <div className="flex items-center justify-center py-8 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                Loading snapshots…
+              </div>
+            ) : snapshots.length === 0 ? (
+              <div className="py-6 text-center text-sm text-muted-foreground">No snapshots found.</div>
+            ) : (
+              <ul className="divide-y">
+                {snapshots.map((s) => {
+                  const selected = s.id === selectedSnapshot?.id;
+                  return (
+                    <li
+                      key={s.id}
+                      className={`px-3 py-2 cursor-pointer flex items-center justify-between hover:bg-accent ${
+                        selected ? "bg-accent" : ""
+                      }`}
+                      onClick={() => setSelectedSnapshot(s)}
+                    >
+                      <div className="min-w-0">
+                        <div className="font-medium truncate">{s.name}</div>
+                        <div className="text-xs text-muted-foreground truncate">
+                          {s.time_created ? new Date(s.time_created).toLocaleString() : "—"}
+                          {s.sku ? ` • ${s.sku}` : "" }
+                          {s.provisioning_state ? ` • ${s.provisioning_state}` : ""}
+                        </div>
+                      </div>
+                      {selected ? (
+                        <Badge className="ml-3 inline-flex items-center gap-1">
+                          <CheckCircle2 className="h-3 w-3" /> Selected
+                        </Badge>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+
+          {selectedSnapshot ? (
+            <p className="text-xs text-muted-foreground">
+              Using snapshot: <code>{selectedSnapshot.name}</code>
+            </p>
+          ) : (
+            <p className="text-xs text-muted-foreground">Select a snapshot to continue.</p>
+          )}
         </div>
 
         {/* Expiry */}
@@ -243,7 +358,7 @@ export default function WindowsSnapshotParams({
             type="datetime-local"
             value={expiresLocal}
             onChange={(e) => setExpiresLocal(e.target.value)}
-            min={defaultLocalDateTime(1)}
+            min={defaultLocalDateTime(1)} // prevent past selection
           />
           <p className="text-xs text-muted-foreground">
             Pick the date & time this lab should expire (your local time). It will be stored in UTC.
@@ -266,13 +381,10 @@ export default function WindowsSnapshotParams({
           <div className="space-y-3">
             {disks.map((d, i) => (
               <Card key={i} className="p-3">
-                <div className="grid grid-cols-1 md:grid-cols-5 gap-2">
+                <div className="grid grid-cols-1 sm-grid-cols-5 md:grid-cols-5 gap-2">
                   <div className="space-y-1">
                     <Label>Name</Label>
-                    <Input
-                      value={d.name}
-                      onChange={(e) => updateDisk(i, { name: e.target.value })}
-                    />
+                    <Input value={d.name} onChange={(e) => updateDisk(i, { name: e.target.value })} />
                   </div>
                   <div className="space-y-1">
                     <Label>LUN</Label>
@@ -280,20 +392,13 @@ export default function WindowsSnapshotParams({
                       type="number"
                       min={0}
                       value={d.lun}
-                      onChange={(e) =>
-                        updateDisk(i, { lun: Number(e.target.value || 0) })
-                      }
+                      onChange={(e) => updateDisk(i, { lun: Number(e.target.value || 0) })}
                     />
                   </div>
                   <div className="space-y-1">
                     <Label>Caching</Label>
-                    <Select
-                      value={d.caching}
-                      onValueChange={(v: any) => updateDisk(i, { caching: v })}
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
+                    <Select value={d.caching} onValueChange={(v: any) => updateDisk(i, { caching: v })}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="ReadWrite">ReadWrite</SelectItem>
                         <SelectItem value="ReadOnly">ReadOnly</SelectItem>
@@ -307,11 +412,7 @@ export default function WindowsSnapshotParams({
                       type="number"
                       min={1}
                       value={d.disk_size_gb}
-                      onChange={(e) =>
-                        updateDisk(i, {
-                          disk_size_gb: Number(e.target.value || 0),
-                        })
-                      }
+                      onChange={(e) => updateDisk(i, { disk_size_gb: Number(e.target.value || 0) })}
                     />
                   </div>
                   <div className="flex items-end">
@@ -332,10 +433,10 @@ export default function WindowsSnapshotParams({
       </div>
 
       <div className="flex gap-3">
-        <Button type="button" variant="outline" onClick={onBack} disabled={loading}>
+        <Button type="button" variant="outline" onClick={onBack}>
           Previous
         </Button>
-        <Button className="ml-auto" onClick={handleSubmit} disabled={loading}>
+        <Button className="ml-auto" onClick={handleSubmit} disabled={loading || !selectedSnapshot}>
           {loading ? (
             <>
               <Loader2 className="w-4 h-4 mr-2 animate-spin" /> Creating…

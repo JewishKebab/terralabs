@@ -1,5 +1,6 @@
+// src/components/dashboard/AppSidebar.tsx
 import { useEffect, useMemo, useState } from "react";
-import { Home, Server, Settings, LogOut, User, UserCircle } from "lucide-react";
+import { Home, Server, Settings, LogOut, User, UserCircle, Monitor } from "lucide-react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
 import {
@@ -34,6 +35,7 @@ type Me = {
 const navItems = [
   { title: "Dashboard", url: "/dashboard", icon: Home },
   { title: "Running Labs", url: "/labs", icon: Server },
+  { title: "Template VM", url: "/template-vm", icon: Monitor }, // new
 ];
 
 export function AppSidebar() {
@@ -66,7 +68,7 @@ export function AppSidebar() {
         const res = await api.get("/api/me");
         if (mounted) setUser(res.data as Me);
       } catch {
-        // Not logged in or token invalid — bounce to auth
+        // not logged in -> go to auth
         navigate("/auth", { replace: true });
       }
     })();
@@ -75,12 +77,17 @@ export function AppSidebar() {
     };
   }, [api, navigate]);
 
+  // AppSidebar.tsx
   const handleLogout = async () => {
-    // Clear JWT and go to /auth
     localStorage.removeItem("auth_token");
+    // clear per-user template cache(s)
+    Object.keys(localStorage)
+      .filter(k => k.startsWith("template_vm_session"))
+      .forEach(k => localStorage.removeItem(k));
     toast({ title: "Logged Out", description: "You have been successfully logged out." });
     navigate("/auth", { replace: true });
   };
+
 
   const displayName =
     [user?.first_name, user?.last_name].filter(Boolean).join(" ") || user?.email || "User";
@@ -88,7 +95,7 @@ export function AppSidebar() {
   return (
     <Sidebar collapsible="icon">
       <SidebarContent>
-        {/* User Welcome Section */}
+        {/* User section */}
         {!isCollapsed && (
           <div className="p-4">
             <DropdownMenu>
@@ -138,7 +145,9 @@ export function AppSidebar() {
                       className={({ isActive }) =>
                         [
                           "flex items-center gap-2 rounded-md px-2 py-2 transition-colors",
-                          isActive ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent",
+                          isActive
+                            ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                            : "hover:bg-sidebar-accent",
                         ].join(" ")
                       }
                     >
@@ -155,3 +164,6 @@ export function AppSidebar() {
     </Sidebar>
   );
 }
+
+// Provide default export too, in case some files import it as default
+export default AppSidebar;

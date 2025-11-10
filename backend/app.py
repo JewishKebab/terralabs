@@ -5,28 +5,37 @@ from flask_cors import CORS, cross_origin
 from dotenv import load_dotenv
 from functools import wraps
 from datetime import datetime, timedelta, timezone
-import jwt, os
+import jwt, os, re, time
+from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
 
-# GitLab helpers (create + high-level delete flow)
+load_dotenv(override=True)
+
+# Template VM logic (no LabId/LabCourse in this flow)
+from template_vm import (
+    create_template_vm,               # create_template_vm(user_id, image_id, image_version, os_type, vm_size, admin_username, admin_password)
+    get_template_vm_status,           # get_template_vm_status(user_id) -> dict or None
+    snapshot_and_delete_template_vm,  # snapshot_and_delete_template_vm(user_id, snapshot_name)
+    delete_template_vm,               # delete_template_vm(user_id)
+)
+
+# GitLab helpers (unchanged)
 from gitlab_utils import (
     MODULE_SCHEMAS,
     create_lab_in_gitlab,
     course_dir,
-    delete_lab as delete_lab_flow,  # Azure deletion + repo MR + tfstate delete
+    delete_lab as delete_lab_flow,
 )
 
-# Azure Blob
+# Azure Blob (unchanged)
 from azure.storage.blob import (
     BlobServiceClient,
     BlobSasPermissions,
     generate_blob_sas
 )
 
-# Azure VM helpers
-from azure_client import list_running_labs, start_vm_by_id, stop_vm_by_id
-
-# ---------- Load env ----------
-load_dotenv(override=True)
+# Azure VM helpers (unchanged)
+from azure_client import list_running_labs, start_vm_by_id, stop_vm_by_id, list_snapshots_in_rg
+from azure_client import _ensure_clients as _az_ensure, _compute as _az_compute
 
 # ---------- Flask / CORS ----------
 app = Flask(__name__)
@@ -54,10 +63,8 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME")
 AZURE_BLOB_KEY = os.environ.get("AZURE_BLOB_KEY")
 AZURE_CONTAINER_NAME = os.environ.get("AZURE_CONTAINER_NAME")
-
 if not (AZURE_STORAGE_ACCOUNT_NAME and AZURE_BLOB_KEY and AZURE_CONTAINER_NAME):
     raise RuntimeError("Missing Azure Storage env vars: AZURE_STORAGE_ACCOUNT_NAME, AZURE_BLOB_KEY, AZURE_CONTAINER_NAME")
-
 AZURE_ACCOUNT_URL = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
 
 # ---------- DB ----------
@@ -95,6 +102,13 @@ def token_required(fn):
         return fn(*args, **kwargs)
     return wrapper
 
+def _current_user():
+    auth = request.headers.get("Authorization", "")
+    token = auth.split(" ", 1)[1]
+    decoded = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+    user = User.query.get(decoded["user_id"])
+    return user
+
 def get_blob_service() -> BlobServiceClient:
     return BlobServiceClient(account_url=AZURE_ACCOUNT_URL, credential=AZURE_BLOB_KEY)
 
@@ -111,6 +125,15 @@ def _parse_iso8601_utc(s: str):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+# Enforce snapshot name "Projects-<Base>-Snapshot"
+_SNAP_MAX = 80
+def _format_snapshot_name_from_base(base: str) -> str:
+    mid = re.sub(r"[^A-Za-z0-9-]+", "", (base or "").strip().replace(" ", "-"))
+    if not mid:
+        mid = "Snapshot"
+    name = f"Projects-{mid}-Snapshot"
+    return name[:_SNAP_MAX]
 
 # ---------- Auth ----------
 @app.route("/api/signup", methods=["POST"])
@@ -164,10 +187,7 @@ def login():
 @app.route("/api/me", methods=["GET"])
 @token_required
 def me():
-    auth = request.headers.get("Authorization", "")
-    token = auth.split(" ", 1)[1]
-    decoded = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-    user = User.query.get(decoded["user_id"])
+    user = _current_user()
     if not user:
         return jsonify({"error": "User not found"}), 404
     return jsonify({
@@ -177,6 +197,54 @@ def me():
         "last_name": user.last_name
     }), 200
 
+# ------------- Snapshots ---------------
+@app.route("/api/snapshots", methods=["GET", "OPTIONS"])
+@cross_origin(
+    origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    methods=["GET", "OPTIONS"],
+    headers=["Content-Type", "Authorization"]
+)
+@token_required
+def api_list_snapshots():
+    # Preflight
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    try:
+        # Ensure Azure clients
+        _az_ensure()
+        compute = _az_compute()
+
+        # RG to read from
+        snapshot_rg = os.environ.get("TL_SNAPSHOT_RG")
+        if not snapshot_rg:
+            return jsonify({"error": "TL_SNAPSHOT_RG is not set"}), 500
+
+        # Optional filter: ?q=foo (case-insensitive contains)
+        q = (request.args.get("q") or "").strip().lower()
+
+        # Get snapshots in that RG
+        snaps = list(compute.snapshots.list_by_resource_group(snapshot_rg))
+        items = []
+        for s in snaps:
+            name = getattr(s, "name", "")
+            if q and q not in name.lower():
+                continue
+            items.append({
+                "name": name,
+                "id": getattr(s, "id", None),
+                "time_created": getattr(s, "time_created", None).isoformat() if getattr(s, "time_created", None) else None,
+                "sku": getattr(getattr(s, "sku", None), "name", None),
+                "provisioning_state": getattr(s, "provisioning_state", None),
+            })
+
+        # Sort newest first if time_created available
+        items.sort(key=lambda x: x["time_created"] or "", reverse=True)
+        return jsonify({"snapshots": items}), 200
+
+    except Exception as e:
+        print("[/api/snapshots] Error:", e)
+        return jsonify({"error": str(e)}), 500
 # ---------- Azure Blob (states) ----------
 @app.route("/api/states", methods=["GET"])
 @token_required
@@ -228,13 +296,12 @@ def create_lab():
         course       = (data.get("course") or "").strip()
         lab_name     = (data.get("lab_name") or "").strip()
         module_name  = (data.get("module_name") or "").strip()
-        expires_at   = data.get("expires_at")  # ISO string from UI
+        expires_at   = data.get("expires_at")
         params       = data.get("params") or {}
 
         if not course or not lab_name or not module_name:
             return jsonify({"error": "Missing course, lab_name or module_name"}), 400
 
-        # add lifecycle timestamps into tf_vars so templates can read them
         params = dict(params)
         params.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         if expires_at:
@@ -328,25 +395,88 @@ def delete_lab():
         print("[/api/labs/delete] Error:", e)
         return jsonify({"error": str(e)}), 500
 
-# ---------- CORS headers after each request ----------
+# ---------- Template VM API (per-user; no LabId/Course) ----------
+@app.route("/api/template-vm/create", methods=["POST"])
+@token_required
+def api_template_vm_create():
+    u = _current_user()
+    data = request.get_json(force=True) or {}
+    body = {
+        "user_id": u.email,  # TerraLabsUser tag in template_vm.py
+        "image_id": data.get("image_id"),
+        "image_version": data.get("image_version") or "latest",
+        "os_type": data.get("os_type") or "windows",
+        "vm_size": data.get("vm_size") or "Standard_B2s",
+        "admin_username": data.get("admin_username"),
+        "admin_password": data.get("admin_password"),
+    }
+    try:
+        res = create_template_vm(**body)
+        return jsonify(res), 200
+    except Exception as e:
+        print("[/api/template-vm/create] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/template-vm/status", methods=["GET"])
+@token_required
+def api_template_vm_status():
+    """
+    Returns the caller's template VM status.
+    Always resolves by TerraLabsUser tag.
+    If nothing found, returns 200 {"exists": False}.
+    """
+    u = _current_user()
+    try:
+        payload, code = get_template_vm_status(user_id=u.email, vm_id=None, soft_not_found=True)
+        # Force 200 for soft-not-found semantics
+        if code == 404:
+            return jsonify({"exists": False}), 200
+        return jsonify(payload), 200
+    except (ResourceNotFoundError, HttpResponseError):
+        # Treat Azure 'not found' as soft miss
+        return jsonify({"exists": False}), 200
+    except Exception as e:
+        print("[/api/template-vm/status] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/template-vm/snapshot", methods=["POST"])
+@token_required
+def api_template_vm_snapshot():
+    u = _current_user()
+    data = request.get_json(force=True) or {}
+    try:
+        raw = (data.get("snapshot_name") or "").strip()
+        # Accept either raw mid or a full Projects-<x>-Snapshot and normalize
+        if raw.startswith("Projects-") and raw.endswith("-Snapshot"):
+            mid = raw[len("Projects-"):-len("-Snapshot")]
+            snapshot_name = _format_snapshot_name_from_base(mid)
+        else:
+            snapshot_name = _format_snapshot_name_from_base(raw)
+
+        res = snapshot_and_delete_template_vm(user_id=u.email, snapshot_name=snapshot_name)
+        return jsonify(res), 200
+    except Exception as e:
+        print("[/api/template-vm/snapshot] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/template-vm/discard", methods=["POST"])
+@token_required
+def api_template_vm_discard():
+    u = _current_user()
+    try:
+        res = delete_template_vm(user_id=u.email)
+        return jsonify(res), 200
+    except Exception as e:
+        print("[/api/template-vm/discard] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+# ---------- CORS headers ----------
 @app.after_request
 def add_cors_headers(resp):
     resp.headers.setdefault("Access-Control-Allow-Origin", "http://localhost:8080")
     resp.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization")
     resp.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     return resp
-
-# ---------- Debug ----------
-@app.route("/api/debug/azure", methods=["GET"])
-@token_required
-def debug_azure():
-    try:
-        from azure_client import debug_snapshot
-        snap = debug_snapshot(max_vms=15)
-        return jsonify(snap), 200
-    except Exception as e:
-        print("[/api/debug/azure] Error:", e)
-        return jsonify({"error": str(e)}), 500
 
 # ---------- Main ----------
 if __name__ == "__main__":

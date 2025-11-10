@@ -250,7 +250,21 @@ def list_running_labs() -> List[Dict[str, Any]]:
     labs.sort(key=lambda x: (x["course"], x["lab_id"]))
     return labs
 
-
+def list_snapshots_in_rg(resource_group: str) -> List[Dict[str, Any]]:
+    """
+    Return snapshots in the given RG as [{name, id, time_created}], newest first.
+    """
+    _ensure_clients()
+    items = []
+    for s in _COMPUTE.snapshots.list_by_resource_group(resource_group):
+        items.append({
+            "name": getattr(s, "name", None),
+            "id": getattr(s, "id", None),
+            "time_created": getattr(s, "time_created", None).isoformat()
+                if getattr(s, "time_created", None) else None,
+        })
+    items.sort(key=lambda x: x["time_created"] or "", reverse=True)
+    return items
 # ---------------- Power ops ----------------
 def start_vm_by_id(vm_id: str) -> str:
     _ensure_clients()
