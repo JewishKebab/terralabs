@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { BackendSelection, LabInfo } from "./steps/BackendSelection";
 import { ModuleSelection } from "./steps/ModuleSelection";
 import ParameterConfiguration from "./steps/ParameterConfiguration";
@@ -12,7 +18,12 @@ const steps = [
   { id: 4, name: "Pending", description: "Awaiting approval" },
 ];
 
-export function ProvisioningStepper() {
+type Props = {
+  /** When present, only these course ids are allowed (teacher scope). */
+  lockToCourses?: string[];
+};
+
+export function ProvisioningStepper({ lockToCourses }: Props) {
   const [currentStep, setCurrentStep] = useState(1);
   const [lab, setLab] = useState<LabInfo | null>(null);
   const [moduleName, setModuleName] = useState<string | null>(null);
@@ -21,7 +32,7 @@ export function ProvisioningStepper() {
   const handleProvisioningDone = () => {
     if (!lab) return;
     setPending(true);
-    setCurrentStep(4); // switch to pending state
+    setCurrentStep(4);
   };
 
   return (
@@ -36,6 +47,7 @@ export function ProvisioningStepper() {
             <ProvisioningPending course={lab.course} labName={lab.labName} />
           ) : currentStep === 1 ? (
             <BackendSelection
+              lockToCourses={lockToCourses}
               onComplete={(info) => {
                 setLab(info);
                 setCurrentStep(2);
@@ -63,3 +75,5 @@ export function ProvisioningStepper() {
     </div>
   );
 }
+
+export default ProvisioningStepper;

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import axios, { AxiosHeaders } from "axios";
-import { SidebarProvider } from "@/components/ui/sidebar";
+import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/dashboard/AppSidebar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -41,8 +42,10 @@ import {
   Trash2,
   Play,
   Square,
+  LogOut,
 } from "lucide-react";
 import logo from "@/assets/terralabs-logo.png";
+import { useAccess } from "@/hooks/useAccess";
 
 type Vm = {
   id: string;
@@ -64,6 +67,9 @@ type Lab = {
 
 export default function RunningLabsPage() {
   const { toast } = useToast();
+  const navigate = useNavigate();
+  const { isStudent } = useAccess();
+
   const [loading, setLoading] = useState(true);
   const [labs, setLabs] = useState<Lab[]>([]);
 
@@ -154,12 +160,11 @@ export default function RunningLabsPage() {
         course: deleteTarget.course,
         lab_id: deleteTarget.lab_id,
       };
-      const res = await api.post("/api/labs/delete", body);
+      await api.post("/api/labs/delete", body);
 
-      const mrUrl = res?.data?.delete_mr?.merge_request_url;
       toast({
         title: "Delete requested",
-        description: mrUrl ? `MR opened: ${mrUrl}` : "Azure deletion + MR requested.",
+        description: "Azure deletion + MR requested.",
       });
 
       setDeleteOpen(false);
@@ -183,13 +188,16 @@ export default function RunningLabsPage() {
     const byCourse = courseFilter === "__all__" ? true : lab.course === courseFilter;
     const byIp = qIp
       ? lab.vms.some(
-          (v) =>
-            (v.private_ip || "").includes(qIp) ||
-            (v.public_ip || "").includes(qIp)
+          (v) => (v.private_ip || "").includes(qIp) || (v.public_ip || "").includes(qIp)
         )
       : true;
     return byLab && byCourse && byIp;
   });
+
+  const handleLogout = () => {
+    localStorage.removeItem("auth_token");
+    navigate("/auth", { replace: true });
+  };
 
   return (
     <SidebarProvider>
@@ -197,18 +205,23 @@ export default function RunningLabsPage() {
         <AppSidebar />
 
         <div className="flex-1 flex flex-col">
-          {/* Header */}
+          {/* Header: match other pages (h-16) */}
           <header className="h-16 border-b bg-card flex items-center justify-between px-6 shadow-sm">
             <div className="flex items-center gap-4">
+              <SidebarTrigger />
               <div className="py-2 rounded-md">
-                <img src={logo} alt="TerraLabs" className="h-10" />
+                <img src={logo} alt="TerraLabs" className="h-12" />
               </div>
-              <h1 className="text-xl font-semibold">Running Labs</h1>
+              <h1 className="text-xl font-semibold">{isStudent ? "Labs" : "Running Labs"}</h1>
             </div>
             <div className="flex items-center gap-2">
               <Button variant="outline" size="sm" onClick={fetchLabs}>
                 <RefreshCw className="mr-2 h-4 w-4" />
                 Refresh
+              </Button>
+              <Button variant="outline" size="sm" onClick={handleLogout}>
+                <LogOut className="mr-2 h-4 w-4" />
+                Logout
               </Button>
             </div>
           </header>
@@ -280,10 +293,7 @@ export default function RunningLabsPage() {
                 </Card>
               ) : (
                 filtered.map((lab) => (
-                  <Card
-                    key={`${lab.course}:${lab.lab_id}`}
-                    className="shadow-elegant"
-                  >
+                  <Card key={`${lab.course}:${lab.lab_id}`} className="shadow-elegant">
                     <CardHeader>
                       <div className="flex items-center justify-between">
                         <CardTitle className="flex items-center gap-2">
@@ -292,36 +302,36 @@ export default function RunningLabsPage() {
                           <Badge variant="secondary">{lab.course}</Badge>
                         </CardTitle>
 
-                        <div className="flex items-center gap-4 text-sm text-muted-foreground">
-                          {lab.created_at && (
-                            <span className="inline-flex items-center gap-1">
-                              <Clock className="h-4 w-4" /> Created:{" "}
-                              {new Date(lab.created_at).toLocaleString()}
-                            </span>
-                          )}
-                          {lab.expires_at && (
-                            <span className="inline-flex items-center gap-1">
-                              <Clock className="h-4 w-4" /> Expires:{" "}
-                              {new Date(lab.expires_at).toLocaleString()}
-                            </span>
-                          )}
-                          <Button
-                            variant="destructive"
-                            size="sm"
-                            onClick={() => openDelete(lab)}
-                          >
-                            <Trash2 className="h-4 w-4 mr-2" />
-                            Delete Lab
-                          </Button>
-                        </div>
+                        {!isStudent && (
+                          <div className="flex items-center gap-4 text-sm text-muted-foreground">
+                            {lab.created_at && (
+                              <span className="inline-flex items-center gap-1">
+                                <Clock className="h-4 w-4" /> Created:{" "}
+                                {new Date(lab.created_at).toLocaleString()}
+                              </span>
+                            )}
+                            {lab.expires_at && (
+                              <span className="inline-flex items-center gap-1">
+                                <Clock className="h-4 w-4" /> Expires:{" "}
+                                {new Date(lab.expires_at).toLocaleString()}
+                              </span>
+                            )}
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              onClick={() => openDelete(lab)}
+                            >
+                              <Trash2 className="h-4 w-4 mr-2" />
+                              Delete Lab
+                            </Button>
+                          </div>
+                        )}
                       </div>
                     </CardHeader>
 
                     <CardContent>
                       {lab.vms.length === 0 ? (
-                        <p className="text-sm text-muted-foreground">
-                          No VMs discovered for this lab.
-                        </p>
+                        <p className="text-sm text-muted-foreground">No VMs discovered for this lab.</p>
                       ) : (
                         <div className="overflow-x-auto rounded-md border">
                           <Table className="min-w-[720px]">
@@ -331,9 +341,9 @@ export default function RunningLabsPage() {
                                 <TableHead className="w-1/6">Size</TableHead>
                                 <TableHead className="w-1/6">Private IP</TableHead>
                                 <TableHead className="w-1/6">Power</TableHead>
-                                <TableHead className="w-1/6 text-center">
-                                  Actions
-                                </TableHead>
+                                {!isStudent && (
+                                  <TableHead className="w-1/6 text-center">Actions</TableHead>
+                                )}
                               </TableRow>
                             </TableHeader>
                             <TableBody>
@@ -357,24 +367,26 @@ export default function RunningLabsPage() {
                                       {(vm.power_state || "").toUpperCase() || "-"}
                                     </Badge>
                                   </TableCell>
-                                  <TableCell className="text-center">
-                                    <div className="inline-flex gap-2">
-                                      <Button
-                                        variant="secondary"
-                                        size="sm"
-                                        onClick={() => powerStart(vm)}
-                                      >
-                                        <Play className="h-4 w-4 mr-1" /> Start
-                                      </Button>
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        onClick={() => powerStop(vm)}
-                                      >
-                                        <Square className="h-4 w-4 mr-1" /> Stop
-                                      </Button>
-                                    </div>
-                                  </TableCell>
+                                  {!isStudent && (
+                                    <TableCell className="text-center">
+                                      <div className="inline-flex gap-2">
+                                        <Button
+                                          variant="secondary"
+                                          size="sm"
+                                          onClick={() => powerStart(vm)}
+                                        >
+                                          <Play className="h-4 w-4 mr-1" /> Start
+                                        </Button>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => powerStop(vm)}
+                                        >
+                                          <Square className="h-4 w-4 mr-1" /> Stop
+                                        </Button>
+                                      </div>
+                                    </TableCell>
+                                  )}
                                 </TableRow>
                               ))}
                             </TableBody>
@@ -396,9 +408,9 @@ export default function RunningLabsPage() {
           <DialogHeader>
             <DialogTitle>Delete Lab</DialogTitle>
             <DialogDescription>
-              This will delete all Azure resources tagged for this lab, open a
-              Merge Request that removes the lab folder from GitLab, and delete
-              the lab&apos;s Terraform state. This action cannot be undone.
+              This will delete all Azure resources tagged for this lab, open a Merge Request that
+              removes the lab folder from GitLab, and delete the lab&apos;s Terraform state. This
+              action cannot be undone.
             </DialogDescription>
           </DialogHeader>
 
@@ -412,18 +424,10 @@ export default function RunningLabsPage() {
           </div>
 
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setDeleteOpen(false)}
-              disabled={deleteWorking}
-            >
+            <Button variant="outline" onClick={() => setDeleteOpen(false)} disabled={deleteWorking}>
               Cancel
             </Button>
-            <Button
-              variant="destructive"
-              onClick={confirmDelete}
-              disabled={deleteWorking}
-            >
+            <Button variant="destructive" onClick={confirmDelete} disabled={deleteWorking}>
               {deleteWorking ? "Deleting…" : "Yes, delete everything"}
             </Button>
           </DialogFooter>

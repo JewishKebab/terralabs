@@ -1,6 +1,16 @@
 // src/components/dashboard/AppSidebar.tsx
 import { useEffect, useMemo, useState } from "react";
-import { Home, Server, Settings, LogOut, User, UserCircle, Monitor } from "lucide-react";
+import {
+  Home,
+  Server,
+  Settings,
+  LogOut,
+  User,
+  UserCircle,
+  Monitor,
+  GraduationCap,
+  BadgeInfo,
+} from "lucide-react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { useToast } from "@/hooks/use-toast";
 import {
@@ -34,8 +44,8 @@ type Me = {
 
 const navItems = [
   { title: "Dashboard", url: "/dashboard", icon: Home },
+  { title: "Template VM", url: "/template-vm", icon: Monitor },
   { title: "Running Labs", url: "/labs", icon: Server },
-  { title: "Template VM", url: "/template-vm", icon: Monitor }, // new
 ];
 
 export function AppSidebar() {
@@ -45,6 +55,11 @@ export function AppSidebar() {
   const { toast } = useToast();
 
   const [user, setUser] = useState<Me | null>(null);
+
+  // AAD tags saved by Auth flow
+  const [role, setRole] = useState<string | null>(null);
+  const [course, setCourse] = useState<string | null>(null);
+  const [section, setSection] = useState<string | null>(null);
 
   const api = useMemo(() => {
     const i = axios.create({
@@ -68,7 +83,6 @@ export function AppSidebar() {
         const res = await api.get("/api/me");
         if (mounted) setUser(res.data as Me);
       } catch {
-        // not logged in -> go to auth
         navigate("/auth", { replace: true });
       }
     })();
@@ -77,36 +91,58 @@ export function AppSidebar() {
     };
   }, [api, navigate]);
 
-  // AppSidebar.tsx
+  useEffect(() => {
+    const r = (localStorage.getItem("aad_role") || "").toLowerCase();
+    setRole(r);
+    setCourse(localStorage.getItem("aad_course"));
+    setSection(localStorage.getItem("aad_section"));
+  }, []);
+
   const handleLogout = async () => {
     localStorage.removeItem("auth_token");
-    // clear per-user template cache(s)
     Object.keys(localStorage)
-      .filter(k => k.startsWith("template_vm_session"))
-      .forEach(k => localStorage.removeItem(k));
+      .filter((k) => k.startsWith("template_vm_session"))
+      .forEach((k) => localStorage.removeItem(k));
+    localStorage.removeItem("aad_role");
+    localStorage.removeItem("aad_course");
+    localStorage.removeItem("aad_section");
+    localStorage.removeItem("aad_groups");
     toast({ title: "Logged Out", description: "You have been successfully logged out." });
     navigate("/auth", { replace: true });
   };
 
-
   const displayName =
-    [user?.first_name, user?.last_name].filter(Boolean).join(" ") || user?.email || "User";
+    [user?.first_name, user?.last_name].filter(Boolean).join(" ") ||
+    user?.email ||
+    "User";
+
+  const roleLabel = role ? role.charAt(0).toUpperCase() + role.slice(1) : null;
+  const isAsgard = (role || "").toLowerCase() === "asgard";
 
   return (
     <Sidebar collapsible="icon">
       <SidebarContent>
-        {/* User section */}
+        {/* Compact user header */}
         {!isCollapsed && (
-          <div className="p-4">
+          <div className="px-3 pt-3 pb-2 space-y-2">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <button className="flex items-center gap-3 mb-2 w-full hover:bg-sidebar-accent rounded-lg p-2 transition-colors">
-                  <div className="h-10 w-10 rounded-full bg-gradient-primary flex items-center justify-center shadow-glow">
-                    <User className="h-5 w-5 text-primary-foreground" />
+                <button
+                  className="flex items-center gap-2 w-full rounded-md px-2 py-2 hover:bg-sidebar-accent transition-colors"
+                  title={displayName}
+                >
+                  <div className="h-9 w-9 rounded-full bg-gradient-primary flex items-center justify-center shadow-glow shrink-0">
+                    <User className="h-4 w-4 text-primary-foreground" />
                   </div>
-                  <div className="flex-1 overflow-hidden text-left">
-                    <p className="text-sm font-medium text-sidebar-foreground">Welcome</p>
-                    <p className="text-xs text-sidebar-foreground/70 truncate">{displayName}</p>
+                  <div className="min-w-0 text-left">
+                    <p className="text-sm font-medium text-sidebar-foreground truncate">
+                      Welcome, {displayName}
+                    </p>
+                    {roleLabel ? (
+                      <p className="text-[11px] leading-4 text-sidebar-foreground/70 truncate">
+                        {roleLabel} — {isAsgard ? "full access" : "signed in"}
+                      </p>
+                    ) : null}
                   </div>
                 </button>
               </DropdownMenuTrigger>
@@ -128,6 +164,29 @@ export function AppSidebar() {
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
+
+            {(role || course || section) && (
+              <div className="rounded-md border bg-sidebar-accent/30 px-2.5 py-2 text-[11.5px] leading-5 text-sidebar-foreground space-y-1">
+                {roleLabel && (
+                  <div className="flex items-center gap-1.5">
+                    <BadgeInfo className="h-3.5 w-3.5 shrink-0" />
+                    <span className="truncate">
+                      Role: <strong>{roleLabel}</strong>
+                    </span>
+                  </div>
+                )}
+                {!isAsgard && (course || section) && (
+                  <div className="flex items-center gap-1.5">
+                    <GraduationCap className="h-3.5 w-3.5 shrink-0" />
+                    <span className="truncate">
+                      {course ? <>Course: <strong>{course}</strong></> : null}
+                      {section ? <> • Section: <strong>{section}</strong></> : null}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
             <Separator className="bg-sidebar-border" />
           </div>
         )}
@@ -165,5 +224,4 @@ export function AppSidebar() {
   );
 }
 
-// Provide default export too, in case some files import it as default
 export default AppSidebar;

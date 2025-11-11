@@ -7,8 +7,36 @@ from functools import wraps
 from datetime import datetime, timedelta, timezone
 import jwt, os, re, time
 from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
-
+from aad_groups import resolve_group_names_from_ids, derive_role_scope
 load_dotenv(override=True)
+
+# ---------------- Azure AD (NEW) ----------------
+import requests
+from jwt import PyJWKClient, InvalidTokenError, decode as pyjwt_decode
+
+AAD_TENANT_ID = os.getenv("AAD_TENANT_ID") 
+AAD_CLIENT_ID = os.getenv("AAD_CLIENT_ID") 
+AAD_ISSUER = f"https://login.microsoftonline.com/{AAD_TENANT_ID}/v2.0" if AAD_TENANT_ID else None
+AAD_JWKS_URI = f"{AAD_ISSUER}/discovery/v2.0/keys" if AAD_TENANT_ID else None
+
+
+
+def _validate_aad_id_token(id_token: str) -> dict:
+    """Validate an AAD v2.0 ID token and return claims dict."""
+    if not (AAD_TENANT_ID and AAD_CLIENT_ID):
+        raise RuntimeError("AAD_TENANT_ID and AAD_CLIENT_ID must be set")
+    jwks_client = PyJWKClient(AAD_JWKS_URI)
+    signing_key = jwks_client.get_signing_key_from_jwt(id_token).key
+    claims = pyjwt_decode(
+        id_token,
+        signing_key,
+        algorithms=["RS256"],
+        audience=AAD_CLIENT_ID,
+        issuer=AAD_ISSUER,
+        options={"verify_at_hash": False},
+    )
+    return claims
+# ------------------------------------------------
 
 # Template VM logic (no LabId/LabCourse in this flow)
 from template_vm import (
@@ -74,17 +102,31 @@ class User(db.Model):
     __tablename__ = "users"
     id          = db.Column(db.Integer, primary_key=True)
     email       = db.Column(db.String(120), unique=True, nullable=False)
-    password    = db.Column(db.String(255), nullable=False)
+    password    = db.Column(db.String(255), nullable=True)  # nullable for AAD users
     first_name  = db.Column(db.String(80),  nullable=True)
     last_name   = db.Column(db.String(80),  nullable=True)
+    # future: role column for admin/teacher/student
 
 # ---------- Helpers ----------
-def make_token(user_id: int) -> str:
-    return jwt.encode(
-        {"user_id": user_id, "exp": datetime.now(timezone.utc) + timedelta(hours=24)},
-        app.config["SECRET_KEY"],
-        algorithm="HS256",
-    )
+def make_token(user_id: int, role: str = None, course: str = None, section: str = None, groups: list[str] = None) -> str:
+    payload = {
+        "user_id": user_id,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=24),
+    }
+    if role:
+        payload["role"] = role
+    if course is not None:
+        payload["course"] = course
+    if section is not None:
+        payload["section"] = section
+    if groups:
+        payload["groups"] = groups  # friendly names (mapped)
+    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+
+def _current_claims():
+    auth = request.headers.get("Authorization", "")
+    token = auth.split(" ", 1)[1] if " " in auth else auth
+    return jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
 
 def token_required(fn):
     @wraps(fn)
@@ -135,7 +177,7 @@ def _format_snapshot_name_from_base(base: str) -> str:
     name = f"Projects-{mid}-Snapshot"
     return name[:_SNAP_MAX]
 
-# ---------- Auth ----------
+# ---------- Auth (local) ----------
 @app.route("/api/signup", methods=["POST"])
 def signup():
     data = request.get_json(force=True) or {}
@@ -147,11 +189,11 @@ def signup():
     if not email or not password_raw or not first_name or not last_name:
         return jsonify({"error": "Email, password, first_name and last_name are required"}), 400
 
-    if User.query.filter_by(email=email).first():
+    if User.query.filter_by(email=email.lower()).first():
         return jsonify({"error": "User already exists"}), 400
 
     hashed = generate_password_hash(password_raw)
-    user = User(email=email, password=hashed, first_name=first_name, last_name=last_name)
+    user = User(email=email.lower(), password=hashed, first_name=first_name, last_name=last_name)
 
     try:
         db.session.add(user)
@@ -176,12 +218,132 @@ def login():
     if not email or not password_raw:
         return jsonify({"error": "Email and password required"}), 400
 
-    user = User.query.filter_by(email=email).first()
-    if not user or not check_password_hash(user.password, password_raw):
+    user = User.query.filter_by(email=email.lower()).first()
+    if not user or not user.password or not check_password_hash(user.password, password_raw):
         return jsonify({"error": "Invalid credentials"}), 401
 
     token = make_token(user.id)
     return jsonify({"token": token, "redirect_url": "/dashboard"}), 200
+
+# ---------- Azure AD login (NEW) ----------
+
+
+@app.route("/api/aad/login", methods=["POST", "OPTIONS"])
+@cross_origin(
+    origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    methods=["POST", "OPTIONS"],
+    headers=["Content-Type", "Authorization"]
+)
+def aad_login():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    if not AAD_TENANT_ID or not AAD_CLIENT_ID:
+        return jsonify({"error": "AAD_TENANT_ID and AAD_CLIENT_ID must be set"}), 400
+
+    data = request.get_json(force=True) or {}
+    id_token = (data.get("id_token") or "").strip()
+    if not id_token:
+        return jsonify({"error": "id_token is required"}), 400
+
+    # DEV: signature not verified (ok for local); add real verification later
+    try:
+        decoded = jwt.decode(id_token, options={"verify_signature": False, "verify_exp": False})
+    except Exception as e:
+        return jsonify({"error": f"Failed to parse id_token: {str(e)}"}), 400
+    
+
+
+
+    #----------------- Identity --------------------
+    # Prefer explicit first/last name fields, but fall back to full "name"
+    full_name = (decoded.get("name") or "").strip()
+    first = (decoded.get("given_name") or "").strip()
+    last = (decoded.get("family_name") or "").strip()
+
+    # If AAD only provides "name", split it into first/last
+    if not (first or last) and full_name:
+        parts = full_name.split()
+        if len(parts) == 1:
+            first = parts[0]
+            last = None
+        else:
+            first = parts[0]
+            last = " ".join(parts[1:])
+
+    # Determine a usable email/UPN
+    email = (
+        (decoded.get("preferred_username") or "").lower()
+        or (decoded.get("email") or "").lower()
+        or (decoded.get("unique_name") or "").lower()
+    )
+
+    if not email:
+        print("[/api/aad/login] Missing email-like claim. Claims:", {
+            k: decoded.get(k)
+            for k in ["preferred_username", "email", "unique_name", "tid", "oid", "name"]
+        })
+        return jsonify({"error": "AAD token missing email/UPN claim"}), 400
+
+    # Resolve group IDs (if the AAD app exposes the 'groups' claim)
+    group_ids = decoded.get("groups", []) or []
+    group_names = resolve_group_names_from_ids(group_ids)
+
+    # Derive our app-specific role, course, section
+    role, course, section = derive_role_scope(group_names)
+
+    # Upsert (create or update) user record
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        user = User(
+            email=email,
+            password=generate_password_hash(os.urandom(8).hex()),
+            first_name=first or None,
+            last_name=last or None,
+        )
+        db.session.add(user)
+        try:
+            db.session.commit()
+        except Exception as e:
+            db.session.rollback()
+            user = User.query.filter_by(email=email).first()
+            if not user:
+                print("[/api/aad/login] Database error:", e)
+                return jsonify({"error": "Database error creating AAD user"}), 500
+    else:
+        # Update first/last name if new info is available
+        updated = False
+        if first and user.first_name != first:
+            user.first_name = first
+            updated = True
+        if last and user.last_name != last:
+            user.last_name = last
+            updated = True
+        if updated:
+            db.session.commit()
+
+    # Build app JWT that includes role, course, and section claims
+    token = make_token(user.id, role=role, course=course, section=section, groups=group_names)
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+
+    return jsonify({
+        "token": token,
+        "redirect_url": "/dashboard",
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "full_name": full_name or " ".join(
+                [p for p in [user.first_name, user.last_name] if p]
+            ) or None,
+        },
+        "role": role,
+        "course": course,
+        "section": section,
+        "groups": group_names,
+    }), 200
 
 # ---------- User info ----------
 @app.route("/api/me", methods=["GET"])
@@ -190,12 +352,25 @@ def me():
     user = _current_user()
     if not user:
         return jsonify({"error": "User not found"}), 404
+
+    # pull role info from our JWT (if present)
+    claims = {}
+    try:
+        claims = _current_claims()
+    except Exception:
+        pass
+
     return jsonify({
         "id": user.id,
         "email": user.email,
         "first_name": user.first_name,
-        "last_name": user.last_name
+        "last_name": user.last_name,
+        "role": claims.get("role", "unknown"),
+        "course": claims.get("course"),
+        "section": claims.get("section"),
+        "groups": claims.get("groups", []),
     }), 200
+
 
 # ------------- Snapshots ---------------
 @app.route("/api/snapshots", methods=["GET", "OPTIONS"])
@@ -245,6 +420,7 @@ def api_list_snapshots():
     except Exception as e:
         print("[/api/snapshots] Error:", e)
         return jsonify({"error": str(e)}), 500
+
 # ---------- Azure Blob (states) ----------
 @app.route("/api/states", methods=["GET"])
 @token_required

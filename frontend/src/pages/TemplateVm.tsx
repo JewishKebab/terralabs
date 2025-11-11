@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import axios, { AxiosHeaders } from "axios";
-import { SidebarProvider } from "@/components/ui/sidebar";
+import { SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/dashboard/AppSidebar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -15,9 +15,23 @@ import {
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
-import { Eye, EyeOff, Cloud, Cpu, RefreshCw, Save, Trash2, Monitor, Loader2, Info } from "lucide-react";
+import {
+  LogOut,
+  Eye,
+  EyeOff,
+  Cloud,
+  Cpu,
+  RefreshCw,
+  Save,
+  Trash2,
+  Monitor,
+  Loader2,
+} from "lucide-react";
 import Lottie from "lottie-react";
 import vmAnim from "@/assets/VM.json";
+import logo from "@/assets/terralabs-logo.png";
+import { useNavigate } from "react-router-dom";
+import { useFullLogout } from "@/hooks/useFullLogout";
 
 type TemplateVm = {
   vm_id: string;
@@ -31,7 +45,12 @@ type TemplateVm = {
   created_at?: string;
 };
 
-type Me = { id: number; email: string; first_name?: string | null; last_name?: string | null };
+type Me = {
+  id: number;
+  email: string;
+  first_name?: string | null;
+  last_name?: string | null;
+};
 
 const API_BASE = "http://localhost:5000";
 const BASE_SESSION_KEY = "template_vm_session";
@@ -62,7 +81,7 @@ const IMAGES = [
   },
 ];
 
-// sanitize the middle part of the snapshot name
+// Sanitize the middle part of the snapshot name
 const cleanSnapBase = (s: string) =>
   (s || "")
     .trim()
@@ -71,27 +90,23 @@ const cleanSnapBase = (s: string) =>
     .slice(0, 40);
 
 export default function TemplateVmPage() {
+  const navigate = useNavigate();
+  const logout = useFullLogout(); // 🔹 shared centralized logout
   const { toast } = useToast();
 
-  // user (for per-user isolation; backend uses JWT email)
   const [me, setMe] = useState<Me | null>(null);
-
-  // form
   const [imageKey, setImageKey] = useState<string>(IMAGES[0].id);
   const [vmSize, setVmSize] = useState<string>("Standard_B2s");
   const [adminUser, setAdminUser] = useState("");
   const [adminPass, setAdminPass] = useState("");
   const [showPass, setShowPass] = useState(false);
-
-  // snapshot input (only when VM exists)
   const [snapBase, setSnapBase] = useState("");
 
-  // state
   const [active, setActive] = useState<TemplateVm | null>(null);
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [polling, setPolling] = useState(false);
-  const [bootLoading, setBootLoading] = useState(true); // 👈 initial "loading..." state until first status completes
+  const [bootLoading, setBootLoading] = useState(true);
 
   const api = useMemo(() => {
     const i = axios.create({
@@ -107,12 +122,10 @@ export default function TemplateVmPage() {
     return i;
   }, []);
 
-  // derive a per-user storage key
   const userSessionKey = useMemo(() => {
     return me?.email ? `${BASE_SESSION_KEY}:${me.email.toLowerCase()}` : BASE_SESSION_KEY;
   }, [me?.email]);
 
-  // fetch user once
   useEffect(() => {
     (async () => {
       try {
@@ -124,10 +137,9 @@ export default function TemplateVmPage() {
     })();
   }, [api]);
 
-  // restore + first status check
   useEffect(() => {
     if (!me?.email) return;
-    // clear other users' cached sessions
+
     Object.keys(localStorage)
       .filter((k) => k.startsWith(`${BASE_SESSION_KEY}:`) && k !== userSessionKey)
       .forEach((k) => localStorage.removeItem(k));
@@ -142,7 +154,6 @@ export default function TemplateVmPage() {
       setActive(null);
     }
 
-    // Initial status fetch (soft): show loader until it returns
     (async () => {
       try {
         const res = await api.get("/api/template-vm/status");
@@ -153,17 +164,15 @@ export default function TemplateVmPage() {
           setActive((prev) => ({ ...(prev || {}), ...data }));
         }
       } catch {
-        // ignore; stay with whatever we have
       } finally {
-        setBootLoading(false); // 👈 end initial loading
+        setBootLoading(false);
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [me?.email]);
 
-  // persist per user
   useEffect(() => {
-    if (active?.vm_id) localStorage.setItem(userSessionKey, JSON.stringify(active));
+    if (active?.vm_id)
+      localStorage.setItem(userSessionKey, JSON.stringify(active));
     else localStorage.removeItem(userSessionKey);
   }, [active, userSessionKey]);
 
@@ -180,6 +189,7 @@ export default function TemplateVmPage() {
         return;
       }
       setActive((prev) => ({ ...(prev || {}), ...data }));
+      if (bootLoading) setBootLoading(false);
     } catch (e: any) {
       const status = e?.response?.status;
       if (status === 404) {
@@ -234,12 +244,8 @@ export default function TemplateVmPage() {
       setActive(vm);
       toast({ title: "Template VM creating", description: "This may take a few minutes…" });
 
-      // show "loading" state during the first discovery loop too
       setBootLoading(true);
-      setTimeout(() => {
-        pollStatus(true);
-        setBootLoading(false);
-      }, 2000);
+      setTimeout(() => pollStatus(true), 2000);
     } catch (e: any) {
       toast({
         variant: "destructive",
@@ -251,7 +257,6 @@ export default function TemplateVmPage() {
     }
   };
 
-  // Final enforced snapshot name shown to user
   const fullSnapshotName = useMemo(() => {
     const mid = cleanSnapBase(snapBase) || "Snapshot";
     return `Projects-${mid}-Snapshot`;
@@ -301,26 +306,37 @@ export default function TemplateVmPage() {
     }
   };
 
-  // -- UI --
   return (
     <SidebarProvider>
       <div className="min-h-screen flex w-full bg-background">
         <AppSidebar />
 
         <div className="flex-1 flex flex-col">
-          {/* Header */}
+          {/* Header (matches Dashboard placement/size) */}
           <header className="h-16 border-b bg-card flex items-center justify-between px-6 shadow-sm">
-            <div className="flex items-center gap-2">
-              <Monitor className="h-5 w-5" />
-              <h1 className="text-lg font-semibold">Template VM</h1>
+            <div className="flex items-center gap-4">
+              <SidebarTrigger />
+              <div className="py-2 rounded-md">
+                <img src={logo} alt="TerraLabs" className="h-12" />
+              </div>
             </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                toast({ title: "Logging out…" });
+                await logout();
+              }}
+            >
+              <LogOut className="mr-2 h-4 w-4" />
+              Logout
+            </Button>
           </header>
 
           {/* Content */}
           <main className="flex-1 p-6 overflow-auto">
             <div className="max-w-6xl mx-auto space-y-6">
-
-              {/* Boot-time loading (first discovery or immediately after create) */}
+              {/* Boot-time loading */}
               {bootLoading && (
                 <Card className="shadow-elegant">
                   <CardContent className="py-10">
@@ -340,9 +356,7 @@ export default function TemplateVmPage() {
                     <CardTitle>Create a Template VM</CardTitle>
                   </CardHeader>
                   <CardContent>
-                    {/* two-column layout: form left, lottie right */}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
-                      {/* Left: form */}
                       <div className="space-y-4">
                         <div className="space-y-2">
                           <Label>Base Image</Label>
@@ -378,7 +392,10 @@ export default function TemplateVmPage() {
 
                         <div className="space-y-2">
                           <Label>Admin Username</Label>
-                          <Input value={adminUser} onChange={(e) => setAdminUser(e.target.value)} />
+                          <Input
+                            value={adminUser}
+                            onChange={(e) => setAdminUser(e.target.value)}
+                          />
                         </div>
 
                         <div className="space-y-2">
@@ -389,13 +406,20 @@ export default function TemplateVmPage() {
                               value={adminPass}
                               onChange={(e) => setAdminPass(e.target.value)}
                             />
-                            <Button variant="outline" type="button" onClick={() => setShowPass((s) => !s)}>
-                              {showPass ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                            <Button
+                              variant="outline"
+                              type="button"
+                              onClick={() => setShowPass((s) => !s)}
+                            >
+                              {showPass ? (
+                                <EyeOff className="h-4 w-4" />
+                              ) : (
+                                <Eye className="h-4 w-4" />
+                              )}
                             </Button>
                           </div>
                         </div>
 
-                        {/* Centered button */}
                         <div className="flex justify-center pt-3">
                           <Button
                             onClick={createTemplateVm}
@@ -414,7 +438,6 @@ export default function TemplateVmPage() {
                         </div>
                       </div>
 
-                      {/* Right: Lottie (nudged right so it’s centered in the blank area) */}
                       <div className="flex justify-center mr-5">
                         <div className="w-72 md:w-80">
                           <Lottie animationData={vmAnim} loop autoplay />
@@ -431,16 +454,15 @@ export default function TemplateVmPage() {
                     <CardTitle>Template VM Status</CardTitle>
                   </CardHeader>
                   <CardContent>
-                    {/* Provisioning banner when not fully ready */}
-                    {(active.provisioning_state && active.provisioning_state.toLowerCase() !== "succeeded") && (
-                      <div className="mb-4 rounded-lg border bg-muted/40 px-4 py-2 text-sm flex items-center gap-2">
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        Provisioning your VM… this may take a little while.
-                      </div>
-                    )}
+                    {active.provisioning_state &&
+                      active.provisioning_state.toLowerCase() !== "succeeded" && (
+                        <div className="mb-4 rounded-lg border bg-muted/40 px-4 py-2 text-sm flex items-center gap-2">
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Provisioning your VM… this may take a little while.
+                        </div>
+                      )}
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
-                      {/* Left: status details + snapshot builder */}
                       <div className="space-y-3">
                         <div className="text-sm">
                           <div className="mb-2">
@@ -453,10 +475,12 @@ export default function TemplateVmPage() {
                             <span className="font-semibold">Name:</span> {active.name || "-"}
                           </div>
                           <div className="mb-2">
-                            <span className="font-semibold">Private IP:</span> {active.private_ip || "-"}
+                            <span className="font-semibold">Private IP:</span>{" "}
+                            {active.private_ip || "-"}
                           </div>
                           <div className="mb-2">
-                            <span className="font-semibold">Public IP:</span> {active.public_ip || "-"}
+                            <span className="font-semibold">Public IP:</span>{" "}
+                            {active.public_ip || "-"}
                           </div>
                           <div className="mb-2 inline-flex items-center gap-2">
                             <Cpu className="h-4 w-4" />
@@ -466,11 +490,12 @@ export default function TemplateVmPage() {
                           </div>
                           <div className="mb-2 inline-flex items-center gap-2">
                             <Cloud className="h-4 w-4" />
-                            <Badge>{(active.provisioning_state || "unknown").toUpperCase()}</Badge>
+                            <Badge>
+                              {(active.provisioning_state || "unknown").toUpperCase()}
+                            </Badge>
                           </div>
                         </div>
 
-                        {/* Snapshot name builder */}
                         <div className="space-y-2 pt-2">
                           <Label>Snapshot Name</Label>
                           <Input
@@ -479,27 +504,37 @@ export default function TemplateVmPage() {
                             onChange={(e) => setSnapBase(e.target.value)}
                           />
                           <p className="text-xs text-muted-foreground">
-                            Final name: <code>{`Projects-${(cleanSnapBase(snapBase) || "Snapshot")}-Snapshot`}</code>
+                            Final name: <code>{fullSnapshotName}</code>
                           </p>
                         </div>
 
                         <div className="flex gap-2">
-                          <Button variant="outline" onClick={() => pollStatus(false)} disabled={polling}>
+                          <Button
+                            variant="outline"
+                            onClick={() => pollStatus(false)}
+                            disabled={polling}
+                          >
                             <RefreshCw className="h-4 w-4 mr-1" />
                             Refresh
                           </Button>
-                          <Button onClick={publishSnapshot} disabled={busy || !snapBase.trim()}>
+                          <Button
+                            onClick={publishSnapshot}
+                            disabled={busy || !snapBase.trim()}
+                          >
                             <Save className="h-4 w-4 mr-1" />
                             Publish Snapshot & Delete VM
                           </Button>
-                          <Button variant="destructive" onClick={discardVm} disabled={busy}>
+                          <Button
+                            variant="destructive"
+                            onClick={discardVm}
+                            disabled={busy}
+                          >
                             <Trash2 className="h-4 w-4 mr-1" />
                             Discard VM
                           </Button>
                         </div>
                       </div>
 
-                      {/* Right: Lottie (also nudged right) */}
                       <div className="flex justify-center mr-5">
                         <div className="w-72 md:w-80">
                           <Lottie animationData={vmAnim} loop autoplay />
