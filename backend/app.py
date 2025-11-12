@@ -5,24 +5,22 @@ from flask_cors import CORS, cross_origin
 from dotenv import load_dotenv
 from functools import wraps
 from datetime import datetime, timedelta, timezone
-import jwt, os, re, time
+import jwt, os, re
 from azure.core.exceptions import ResourceNotFoundError, HttpResponseError
 from aad_groups import resolve_group_names_from_ids, derive_role_scope
+
 load_dotenv(override=True)
 
 # ---------------- Azure AD (NEW) ----------------
-import requests
-from jwt import PyJWKClient, InvalidTokenError, decode as pyjwt_decode
+from jwt import PyJWKClient, decode as pyjwt_decode
 
-AAD_TENANT_ID = os.getenv("AAD_TENANT_ID") 
-AAD_CLIENT_ID = os.getenv("AAD_CLIENT_ID") 
+AAD_TENANT_ID = os.getenv("AAD_TENANT_ID")
+AAD_CLIENT_ID = os.getenv("AAD_CLIENT_ID")
 AAD_ISSUER = f"https://login.microsoftonline.com/{AAD_TENANT_ID}/v2.0" if AAD_TENANT_ID else None
 AAD_JWKS_URI = f"{AAD_ISSUER}/discovery/v2.0/keys" if AAD_TENANT_ID else None
 
 
-
 def _validate_aad_id_token(id_token: str) -> dict:
-    """Validate an AAD v2.0 ID token and return claims dict."""
     if not (AAD_TENANT_ID and AAD_CLIENT_ID):
         raise RuntimeError("AAD_TENANT_ID and AAD_CLIENT_ID must be set")
     jwks_client = PyJWKClient(AAD_JWKS_URI)
@@ -38,15 +36,13 @@ def _validate_aad_id_token(id_token: str) -> dict:
     return claims
 # ------------------------------------------------
 
-# Template VM logic (no LabId/LabCourse in this flow)
 from template_vm import (
-    create_template_vm,               # create_template_vm(user_id, image_id, image_version, os_type, vm_size, admin_username, admin_password)
-    get_template_vm_status,           # get_template_vm_status(user_id) -> dict or None
-    snapshot_and_delete_template_vm,  # snapshot_and_delete_template_vm(user_id, snapshot_name)
-    delete_template_vm,               # delete_template_vm(user_id)
+    create_template_vm,
+    get_template_vm_status,
+    snapshot_and_delete_template_vm,
+    delete_template_vm,
 )
 
-# GitLab helpers (unchanged)
 from gitlab_utils import (
     MODULE_SCHEMAS,
     create_lab_in_gitlab,
@@ -54,15 +50,23 @@ from gitlab_utils import (
     delete_lab as delete_lab_flow,
 )
 
-# Azure Blob (unchanged)
 from azure.storage.blob import (
     BlobServiceClient,
     BlobSasPermissions,
     generate_blob_sas
 )
 
-# Azure VM helpers (unchanged)
-from azure_client import list_running_labs, start_vm_by_id, stop_vm_by_id, list_snapshots_in_rg
+from azure_client import (
+    list_running_labs,
+    start_vm_by_id,
+    stop_vm_by_id,
+    list_snapshots_in_rg,
+    # publish/enroll helpers
+    list_published_labs,
+    set_lab_published,
+    enroll_student_in_lab,
+    find_vm_for_student,
+)
 from azure_client import _ensure_clients as _az_ensure, _compute as _az_compute
 
 # ---------- Flask / CORS ----------
@@ -102,10 +106,9 @@ class User(db.Model):
     __tablename__ = "users"
     id          = db.Column(db.Integer, primary_key=True)
     email       = db.Column(db.String(120), unique=True, nullable=False)
-    password    = db.Column(db.String(255), nullable=True)  # nullable for AAD users
+    password    = db.Column(db.String(255), nullable=True)
     first_name  = db.Column(db.String(80),  nullable=True)
     last_name   = db.Column(db.String(80),  nullable=True)
-    # future: role column for admin/teacher/student
 
 # ---------- Helpers ----------
 def make_token(user_id: int, role: str = None, course: str = None, section: str = None, groups: list[str] = None) -> str:
@@ -120,7 +123,7 @@ def make_token(user_id: int, role: str = None, course: str = None, section: str 
     if section is not None:
         payload["section"] = section
     if groups:
-        payload["groups"] = groups  # friendly names (mapped)
+        payload["groups"] = groups
     return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
 
 def _current_claims():
@@ -168,7 +171,6 @@ def _parse_iso8601_utc(s: str):
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
-# Enforce snapshot name "Projects-<Base>-Snapshot"
 _SNAP_MAX = 80
 def _format_snapshot_name_from_base(base: str) -> str:
     mid = re.sub(r"[^A-Za-z0-9-]+", "", (base or "").strip().replace(" ", "-"))
@@ -176,6 +178,25 @@ def _format_snapshot_name_from_base(base: str) -> str:
         mid = "Snapshot"
     name = f"Projects-{mid}-Snapshot"
     return name[:_SNAP_MAX]
+
+def require_role(*allowed):
+    def deco(fn):
+        @wraps(fn)
+        def inner(*args, **kwargs):
+            try:
+                claims = _current_claims()
+            except Exception:
+                return jsonify({"error": "Invalid token"}), 401
+            role = (claims.get("role") or "").lower()
+            if role not in [a.lower() for a in allowed]:
+                return jsonify({"error": "forbidden"}), 403
+            return fn(*args, **kwargs)
+        return inner
+    return deco
+
+def _display_name(user: User) -> str:
+    full = " ".join([p for p in [user.first_name, user.last_name] if p]).strip()
+    return full or user.email
 
 # ---------- Auth (local) ----------
 @app.route("/api/signup", methods=["POST"])
@@ -225,9 +246,7 @@ def login():
     token = make_token(user.id)
     return jsonify({"token": token, "redirect_url": "/dashboard"}), 200
 
-# ---------- Azure AD login (NEW) ----------
-
-
+# ---------- Azure AD login ----------
 @app.route("/api/aad/login", methods=["POST", "OPTIONS"])
 @cross_origin(
     origins=["http://localhost:8080", "http://127.0.0.1:8080"],
@@ -246,22 +265,15 @@ def aad_login():
     if not id_token:
         return jsonify({"error": "id_token is required"}), 400
 
-    # DEV: signature not verified (ok for local); add real verification later
     try:
         decoded = jwt.decode(id_token, options={"verify_signature": False, "verify_exp": False})
     except Exception as e:
         return jsonify({"error": f"Failed to parse id_token: {str(e)}"}), 400
-    
 
-
-
-    #----------------- Identity --------------------
-    # Prefer explicit first/last name fields, but fall back to full "name"
     full_name = (decoded.get("name") or "").strip()
     first = (decoded.get("given_name") or "").strip()
     last = (decoded.get("family_name") or "").strip()
 
-    # If AAD only provides "name", split it into first/last
     if not (first or last) and full_name:
         parts = full_name.split()
         if len(parts) == 1:
@@ -271,7 +283,6 @@ def aad_login():
             first = parts[0]
             last = " ".join(parts[1:])
 
-    # Determine a usable email/UPN
     email = (
         (decoded.get("preferred_username") or "").lower()
         or (decoded.get("email") or "").lower()
@@ -285,14 +296,10 @@ def aad_login():
         })
         return jsonify({"error": "AAD token missing email/UPN claim"}), 400
 
-    # Resolve group IDs (if the AAD app exposes the 'groups' claim)
     group_ids = decoded.get("groups", []) or []
     group_names = resolve_group_names_from_ids(group_ids)
-
-    # Derive our app-specific role, course, section
     role, course, section = derive_role_scope(group_names)
 
-    # Upsert (create or update) user record
     user = User.query.filter_by(email=email).first()
     if not user:
         user = User(
@@ -311,7 +318,6 @@ def aad_login():
                 print("[/api/aad/login] Database error:", e)
                 return jsonify({"error": "Database error creating AAD user"}), 500
     else:
-        # Update first/last name if new info is available
         updated = False
         if first and user.first_name != first:
             user.first_name = first
@@ -322,7 +328,6 @@ def aad_login():
         if updated:
             db.session.commit()
 
-    # Build app JWT that includes role, course, and section claims
     token = make_token(user.id, role=role, course=course, section=section, groups=group_names)
     if isinstance(token, bytes):
         token = token.decode("utf-8")
@@ -353,7 +358,6 @@ def me():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    # pull role info from our JWT (if present)
     claims = {}
     try:
         claims = _current_claims()
@@ -371,7 +375,6 @@ def me():
         "groups": claims.get("groups", []),
     }), 200
 
-
 # ------------- Snapshots ---------------
 @app.route("/api/snapshots", methods=["GET", "OPTIONS"])
 @cross_origin(
@@ -381,24 +384,19 @@ def me():
 )
 @token_required
 def api_list_snapshots():
-    # Preflight
     if request.method == "OPTIONS":
         return ("", 204)
 
     try:
-        # Ensure Azure clients
         _az_ensure()
         compute = _az_compute()
 
-        # RG to read from
         snapshot_rg = os.environ.get("TL_SNAPSHOT_RG")
         if not snapshot_rg:
             return jsonify({"error": "TL_SNAPSHOT_RG is not set"}), 500
 
-        # Optional filter: ?q=foo (case-insensitive contains)
         q = (request.args.get("q") or "").strip().lower()
 
-        # Get snapshots in that RG
         snaps = list(compute.snapshots.list_by_resource_group(snapshot_rg))
         items = []
         for s in snaps:
@@ -413,7 +411,6 @@ def api_list_snapshots():
                 "provisioning_state": getattr(s, "provisioning_state", None),
             })
 
-        # Sort newest first if time_created available
         items.sort(key=lambda x: x["time_created"] or "", reverse=True)
         return jsonify({"snapshots": items}), 200
 
@@ -500,6 +497,104 @@ def labs_running():
         print(f"[labs_running] Error: {e}")
         return jsonify({"error": "Failed to fetch running labs"}), 500
 
+# ---------- Published labs (student view) ----------
+@app.route("/api/labs/published", methods=["GET"])
+@token_required
+def api_labs_published():
+    try:
+        labs = list_published_labs()
+        return jsonify({"labs": labs}), 200
+    except Exception as e:
+        print("[/api/labs/published] Error:", e)
+        return jsonify({"error": "Failed to list published labs"}), 500
+
+# ---------- Publish / Unpublish (supports both URL styles) ----------
+@app.route("/api/labs/publish", methods=["POST"])
+@token_required
+@require_role("segel", "asgard")
+def api_lab_publish_body():
+    data = request.get_json(force=True) or {}
+    course = (data.get("course") or "").strip()
+    lab_id = (data.get("lab_id") or "").strip()
+    if not course or not lab_id:
+        return jsonify({"error": "course and lab_id are required"}), 400
+    try:
+        res = set_lab_published(lab_id=lab_id, course=course, published=True)
+        return jsonify(res), 200
+    except Exception as e:
+        print("[/api/labs/publish] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/labs/<course>/<lab_id>/publish", methods=["POST"])
+@token_required
+@require_role("segel", "asgard")
+def api_lab_publish(course, lab_id):
+    try:
+        res = set_lab_published(lab_id=lab_id, course=course, published=True)
+        return jsonify(res), 200
+    except Exception as e:
+        print("[/api/labs/:course/:lab_id/publish] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/labs/<course>/<lab_id>/unpublish", methods=["POST"])
+@token_required
+@require_role("segel", "asgard")
+def api_lab_unpublish(course, lab_id):
+    try:
+        res = set_lab_published(lab_id=lab_id, course=course, published=False)
+        return jsonify(res), 200
+    except Exception as e:
+        print("[/api/labs/:course/:lab_id/unpublish] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+# ---------- Enroll (supports both URL styles) ----------
+@app.route("/api/labs/enroll", methods=["POST"])
+@token_required
+def api_lab_enroll_body():
+    data = request.get_json(force=True) or {}
+    course = (data.get("course") or "").strip()
+    lab_id = (data.get("lab_id") or "").strip()
+    if not course or not lab_id:
+        return jsonify({"error": "course and lab_id are required"}), 400
+    try:
+        u = _current_user()
+        who = (u.email or "").lower()
+        who_name = _display_name(u)
+        vm = enroll_student_in_lab(lab_id=lab_id, course=course, who=who, who_name=who_name)
+        if not vm:
+            return jsonify({"error": "No free VM available or lab not published"}), 409
+        return jsonify({"assigned_vm": vm}), 200
+    except Exception as e:
+        print("[/api/labs/enroll] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/labs/<course>/<lab_id>/enroll", methods=["POST"])
+@token_required
+def api_lab_enroll(course, lab_id):
+    try:
+        u = _current_user()
+        who = (u.email or "").lower()
+        who_name = _display_name(u)
+        vm = enroll_student_in_lab(lab_id=lab_id, course=course, who=who, who_name=who_name)
+        if not vm:
+            return jsonify({"error": "No free VM available or lab not published"}), 409
+        return jsonify({"assigned_vm": vm}), 200
+    except Exception as e:
+        print("[/api/labs/:course/:lab_id/enroll] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/labs/my-enrollment", methods=["GET"])
+@token_required
+def api_my_enrollment():
+    try:
+        u = _current_user()
+        who = (u.email or "").lower()
+        vm = find_vm_for_student(who)
+        return jsonify({"vm": vm}), 200
+    except Exception as e:
+        print("[/api/labs/my-enrollment] Error:", e)
+        return jsonify({"error": str(e)}), 500
+
 # ---------- VM power ops ----------
 @app.route("/api/vm/start", methods=["POST", "OPTIONS"])
 @cross_origin(origins=["http://localhost:8080", "http://127.0.0.1:8080"],
@@ -538,7 +633,7 @@ def api_vm_stop():
         print("[vm_stop] Error:", e)
         return jsonify({"error": "Failed to request stop"}), 500
 
-# ---------- Delete lab: Azure deletion → MR remove folder → delete tfstate ----------
+# ---------- Delete lab ----------
 @app.route("/api/labs/delete", methods=["POST", "OPTIONS"])
 @cross_origin(
     origins=["http://localhost:8080", "http://127.0.0.1:8080"],
@@ -571,14 +666,14 @@ def delete_lab():
         print("[/api/labs/delete] Error:", e)
         return jsonify({"error": str(e)}), 500
 
-# ---------- Template VM API (per-user; no LabId/Course) ----------
+# ---------- Template VM API ----------
 @app.route("/api/template-vm/create", methods=["POST"])
 @token_required
 def api_template_vm_create():
     u = _current_user()
     data = request.get_json(force=True) or {}
     body = {
-        "user_id": u.email,  # TerraLabsUser tag in template_vm.py
+        "user_id": u.email,
         "image_id": data.get("image_id"),
         "image_version": data.get("image_version") or "latest",
         "os_type": data.get("os_type") or "windows",
@@ -596,20 +691,13 @@ def api_template_vm_create():
 @app.route("/api/template-vm/status", methods=["GET"])
 @token_required
 def api_template_vm_status():
-    """
-    Returns the caller's template VM status.
-    Always resolves by TerraLabsUser tag.
-    If nothing found, returns 200 {"exists": False}.
-    """
     u = _current_user()
     try:
         payload, code = get_template_vm_status(user_id=u.email, vm_id=None, soft_not_found=True)
-        # Force 200 for soft-not-found semantics
         if code == 404:
             return jsonify({"exists": False}), 200
         return jsonify(payload), 200
     except (ResourceNotFoundError, HttpResponseError):
-        # Treat Azure 'not found' as soft miss
         return jsonify({"exists": False}), 200
     except Exception as e:
         print("[/api/template-vm/status] Error:", e)
@@ -622,7 +710,6 @@ def api_template_vm_snapshot():
     data = request.get_json(force=True) or {}
     try:
         raw = (data.get("snapshot_name") or "").strip()
-        # Accept either raw mid or a full Projects-<x>-Snapshot and normalize
         if raw.startswith("Projects-") and raw.endswith("-Snapshot"):
             mid = raw[len("Projects-"):-len("-Snapshot")]
             snapshot_name = _format_snapshot_name_from_base(mid)

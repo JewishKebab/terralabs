@@ -1,4 +1,3 @@
-# backend/azure_client.py
 import os
 import time
 from typing import Dict, List, Any, Optional, Tuple
@@ -10,23 +9,23 @@ from azure.identity import (
 )
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
+from azure.mgmt.compute.models import VirtualMachineUpdate
 
 # ---------------- Config / Tag keys & RG scope ----------------
-TARGET_RESOURCE_GROUP = "Projects-TerraLabs-RG"  # <— only this RG for debug + delete
+TARGET_RESOURCE_GROUP = "Projects-TerraLabs-RG"  # scope for destructive ops
 
-TAG_KEYS_LAB_ID = [
-    os.environ.get("TL_TAG_LAB_ID_KEY") or "LabId",
-    "lab_id", "LabID", "labId", "TLABS_LAB", "TLABS_LAB_ID",
-]
-TAG_KEYS_COURSE = [
-    os.environ.get("TL_TAG_COURSE_KEY") or "LabCourse",
-    "course", "Course", "TLABS_COURSE",
-]
+# Hardcoded tag keys (no env vars)
+TAG_KEYS_LAB_ID = ["LabId", "lab_id", "LabID", "labId", "TLABS_LAB", "TLABS_LAB_ID"]
+TAG_KEYS_COURSE = ["LabCourse", "course", "Course", "TLABS_COURSE"]
 TAG_KEYS_CREATED_AT = ["CreatedAt", "CreatedOnDate", "created_at"]
 TAG_KEYS_EXPIRES_AT = ["ExpiresAt", "expires_at"]
 
-# Optional RG prefix filter for discovery helpers;
-# NOTE: deletion & debug below are hard-scoped to TARGET_RESOURCE_GROUP.
+# Hardcoded “feature” tags
+TAG_PUBLISHED = "Published"                  # value: "true" to count as published
+TAG_OCCUPIED_BY = "occupiedbystudent"        # student id/email
+TAG_OCCUPIED_NAME = "occupiedbystudentname"  # student display name
+
+# Optional RG prefix filter for discovery (kept; if empty matches all)
 RG_PREFIX = os.environ.get("TL_RG_PREFIX") or ""
 
 # ---------------- Clients ----------------
@@ -36,7 +35,6 @@ _SUBSCRIPTION_ID: Optional[str] = None
 
 
 def _build_credential():
-    # Prefer Azure CLI when asked
     if (os.environ.get("TL_USE_AZCLI") or "").lower() in ("1", "true", "yes"):
         return AzureCliCredential()
 
@@ -46,7 +44,6 @@ def _build_credential():
     if tenant and client and secret:
         return ClientSecretCredential(tenant_id=tenant, client_id=client, client_secret=secret)
 
-    # Default chain
     return DefaultAzureCredential(
         exclude_environment_credential=False,
         exclude_managed_identity_credential=False,
@@ -94,6 +91,7 @@ def _parse_resource_id(resource_id: str) -> Dict[str, str]:
 
 def _get_tag(tags: Dict[str, str], keys: List[str]) -> Optional[str]:
     for k in keys:
+        # case-sensitive keys, but try both common spellings we provide
         if k in tags and tags[k]:
             return tags[k]
     return None
@@ -250,21 +248,152 @@ def list_running_labs() -> List[Dict[str, Any]]:
     labs.sort(key=lambda x: (x["course"], x["lab_id"]))
     return labs
 
-def list_snapshots_in_rg(resource_group: str) -> List[Dict[str, Any]]:
+# ---- Published/enrollment helpers --------------------
+
+def _vm_matches_lab(vm: Any, lab_id: str, course: Optional[str]) -> bool:
+    tags = getattr(vm, "tags", {}) or {}
+    tag_lab = _get_tag(tags, TAG_KEYS_LAB_ID)
+    tag_course = _get_tag(tags, TAG_KEYS_COURSE) or ""
+    if tag_lab != lab_id:
+        return False
+    if course and tag_course != course:
+        return False
+    return True
+
+
+def list_published_labs() -> List[Dict[str, Any]]:
     """
-    Return snapshots in the given RG as [{name, id, time_created}], newest first.
+    Returns [{lab_id, course, published: bool}] using VM tags only.
+    A lab is 'published' if ANY VM for (lab_id, course) has tag Published in {"true","1","yes"} (case-insensitive).
     """
     _ensure_clients()
-    items = []
-    for s in _COMPUTE.snapshots.list_by_resource_group(resource_group):
-        items.append({
-            "name": getattr(s, "name", None),
-            "id": getattr(s, "id", None),
-            "time_created": getattr(s, "time_created", None).isoformat()
-                if getattr(s, "time_created", None) else None,
-        })
-    items.sort(key=lambda x: x["time_created"] or "", reverse=True)
-    return items
+    by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for vm in _compute().virtual_machines.list_all():
+        rid = _parse_resource_id(vm.id)
+        if not _rg_is_allowed(rid.get("resourceGroups")):
+            continue
+        tags = getattr(vm, "tags", {}) or {}
+        lab_id = _get_tag(tags, TAG_KEYS_LAB_ID)
+        if not lab_id:
+            continue
+        course = _get_tag(tags, TAG_KEYS_COURSE) or ""
+        key = (lab_id, course)
+        if key not in by_key:
+            by_key[key] = {"lab_id": lab_id, "course": course, "published": False}
+        pv = str(tags.get(TAG_PUBLISHED, "")).lower()
+        if pv in ("true", "1", "yes"):
+            by_key[key]["published"] = True
+    out = list(by_key.values())
+    out.sort(key=lambda x: (x["course"], x["lab_id"]))
+    return out
+
+
+def set_lab_published(*, lab_id: str, course: Optional[str], published: bool) -> Dict[str, Any]:
+    """
+    Set tag {Published: "true"} on ALL VMs belonging to the (lab_id, course) lab.
+    Remove the tag when unpublishing.
+    """
+    _ensure_clients()
+    updated = 0
+    for vm in _compute().virtual_machines.list_all():
+        rid = _parse_resource_id(vm.id)
+        if not _rg_is_allowed(rid.get("resourceGroups")):
+            continue
+        if not _vm_matches_lab(vm, lab_id, course):
+            continue
+        rg = rid.get("resourceGroups")
+        name = rid.get("virtualMachines")
+        tags = dict(getattr(vm, "tags", {}) or {})
+        if published:
+            tags[TAG_PUBLISHED] = "true"
+        else:
+            tags.pop(TAG_PUBLISHED, None)
+        update = VirtualMachineUpdate(tags=tags)
+        _compute().virtual_machines.begin_update(rg, name, update).result()
+        updated += 1
+    return {"updated": updated, "published": published, "lab_id": lab_id, "course": course or ""}
+
+
+def enroll_student_in_lab(*, lab_id: str, course: Optional[str], who: str, who_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Find a VM in the lab that does NOT have occupiedbystudent set; claim it by tagging.
+    Returns VM details or None if none free (or not published).
+    """
+    _ensure_clients()
+    # Require published lab
+    pub_list = list_published_labs()
+    if not any(pl["lab_id"] == lab_id and pl["course"] == (course or "") and pl["published"] for pl in pub_list):
+        return None
+
+    for vm in _compute().virtual_machines.list_all():
+        rid = _parse_resource_id(vm.id)
+        if not _rg_is_allowed(rid.get("resourceGroups")):
+            continue
+        if not _vm_matches_lab(vm, lab_id, course):
+            continue
+        tags = dict(getattr(vm, "tags", {}) or {})
+        if tags.get(TAG_OCCUPIED_BY):
+            continue  # already taken
+
+        # claim it
+        tags[TAG_OCCUPIED_BY] = who
+        if who_name:
+            tags[TAG_OCCUPIED_NAME] = who_name
+        rg = rid.get("resourceGroups")
+        name = rid.get("virtualMachines")
+        update = VirtualMachineUpdate(tags=tags)
+        _compute().virtual_machines.begin_update(rg, name, update).result()
+
+        # info
+        size = getattr(getattr(vm, "hardware_profile", None), "vm_size", None)
+        ips = _resolve_vm_ips(vm)
+        pwr = _get_power_state(vm)
+        return {
+            "id": vm.id,
+            "name": vm.name,
+            "size": size,
+            "private_ip": ips.get("private_ip"),
+            "public_ip": ips.get("public_ip"),
+            "power_state": pwr,
+            "tags": tags,
+            "lab_id": lab_id,
+            "course": course or "",
+        }
+
+    return None
+
+
+def find_vm_for_student(who: str) -> Optional[Dict[str, Any]]:
+    """Return the VM tagged with occupiedbystudent == who (case-insensitive), or None."""
+    _ensure_clients()
+    wl = (who or "").strip().lower()
+    if not wl:
+        return None
+    for vm in _compute().virtual_machines.list_all():
+        rid = _parse_resource_id(vm.id)
+        if not _rg_is_allowed(rid.get("resourceGroups")):
+            continue
+        tags = getattr(vm, "tags", {}) or {}
+        val = (tags.get(TAG_OCCUPIED_BY) or "").strip().lower()
+        if val and val == wl:
+            size = getattr(getattr(vm, "hardware_profile", None), "vm_size", None)
+            ips = _resolve_vm_ips(vm)
+            pwr = _get_power_state(vm)
+            lab_id = _get_tag(tags, TAG_KEYS_LAB_ID) or ""
+            course = _get_tag(tags, TAG_KEYS_COURSE) or ""
+            return {
+                "id": vm.id,
+                "name": vm.name,
+                "size": size,
+                "private_ip": ips.get("private_ip"),
+                "public_ip": ips.get("public_ip"),
+                "power_state": pwr,
+                "tags": tags,
+                "lab_id": lab_id,
+                "course": course,
+            }
+    return None
+
 # ---------------- Power ops ----------------
 def start_vm_by_id(vm_id: str) -> str:
     _ensure_clients()
@@ -291,29 +420,15 @@ def stop_vm_by_id(vm_id: str, deallocate: bool = True) -> str:
         _compute().virtual_machines.begin_power_off(rg, name)
         return "poweroff_requested"
 
-
-# ---------------- Delete by tags (scoped to TARGET_RESOURCE_GROUP) ----------------
+# ---------------- Delete utilities & snapshots ----------------
 def _both_tags_match(tags: Dict[str, str], lab_id: str, course: str) -> bool:
-    """Case-insensitive match on BOTH LabId and LabCourse values."""
     if not tags:
         return False
     val_lab = (_get_tag(tags, TAG_KEYS_LAB_ID) or "").strip().lower()
     val_course = (_get_tag(tags, TAG_KEYS_COURSE) or "").strip().lower()
     return val_lab == lab_id.strip().lower() and val_course == course.strip().lower()
 
-
 def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
-    """
-    Deletes resources ONLY in TARGET_RESOURCE_GROUP that carry BOTH tags:
-      - LabId == lab_id
-      - LabCourse == course (required)
-    Resource types:
-      - Virtual Machines (with force_deletion=True)
-      - NICs
-      - Public IPs
-      - Managed Disks
-    Returns a summary of what was targeted/deleted.
-    """
     _ensure_clients()
     if not course:
         raise ValueError("delete_lab_resources: 'course' is required for strict two-tag match")
@@ -329,7 +444,6 @@ def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: 
         "disks": {"matched": [], "deleted": []},
     }
 
-    # ---------- 1) VMs ----------
     for vm in _compute().virtual_machines.list(TARGET_RESOURCE_GROUP):
         tags = getattr(vm, "tags", {}) or {}
         if not _both_tags_match(tags, lab_id, course):
@@ -340,7 +454,6 @@ def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: 
             poller.result()
             summary["vms"]["deleted"].append({"rg": TARGET_RESOURCE_GROUP, "name": vm.name})
 
-    # ---------- 2) NICs ----------
     for nic in _network().network_interfaces.list(TARGET_RESOURCE_GROUP):
         tags = getattr(nic, "tags", {}) or {}
         if not _both_tags_match(tags, lab_id, course):
@@ -351,7 +464,6 @@ def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: 
             poller.result()
             summary["nics"]["deleted"].append({"rg": TARGET_RESOURCE_GROUP, "name": nic.name})
 
-    # ---------- 3) Public IPs ----------
     for pip in _network().public_ip_addresses.list(TARGET_RESOURCE_GROUP):
         tags = getattr(pip, "tags", {}) or {}
         if not _both_tags_match(tags, lab_id, course):
@@ -362,7 +474,6 @@ def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: 
             poller.result()
             summary["public_ips"]["deleted"].append({"rg": TARGET_RESOURCE_GROUP, "name": pip.name})
 
-    # ---------- 4) Disks ----------
     for disk in _compute().disks.list_by_resource_group(TARGET_RESOURCE_GROUP):
         tags = getattr(disk, "tags", {}) or {}
         if not _both_tags_match(tags, lab_id, course):
@@ -375,13 +486,26 @@ def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: 
 
     return summary
 
+def list_snapshots_in_rg(resource_group: str) -> list[dict]:
+    _ensure_clients()
+    compute = _compute()
+    items = []
+    try:
+        for snap in compute.snapshots.list_by_resource_group(resource_group):
+            items.append({
+                "name": getattr(snap, "name", None),
+                "id": getattr(snap, "id", None),
+                "time_created": getattr(snap, "time_created", None).isoformat()
+                    if getattr(snap, "time_created", None) else None,
+                "sku": getattr(getattr(snap, "sku", None), "name", None),
+                "provisioning_state": getattr(snap, "provisioning_state", None),
+            })
+    except Exception as e:
+        print(f"[list_snapshots_in_rg] Error: {e}")
+    items.sort(key=lambda x: x["time_created"] or "", reverse=True)
+    return items
 
-# --- DEBUG: ONLY target RG ----------------------------------------------------
 def debug_snapshot(max_vms: int = 20):
-    """
-    Show a summary of resources ONLY in the TARGET_RESOURCE_GROUP.
-    Lists VMs and their important tag keys so you can verify matching logic.
-    """
     _ensure_clients()
     rg = TARGET_RESOURCE_GROUP
     vms = list(_compute().virtual_machines.list(rg))
@@ -402,6 +526,9 @@ def debug_snapshot(max_vms: int = 20):
                 "TLABS_COURSE": tags.get("TLABS_COURSE"),
                 "CreatedAt": tags.get("CreatedAt") or tags.get("CreatedOnDate"),
                 "ExpiresAt": tags.get("ExpiresAt"),
+                TAG_PUBLISHED: tags.get(TAG_PUBLISHED),
+                TAG_OCCUPIED_BY: tags.get(TAG_OCCUPIED_BY),
+                TAG_OCCUPIED_NAME: tags.get(TAG_OCCUPIED_NAME),
             }
         })
     return {
@@ -414,8 +541,13 @@ def debug_snapshot(max_vms: int = 20):
 __all__ = [
     "list_vms_in_lab",
     "list_running_labs",
+    "list_published_labs",
+    "set_lab_published",
+    "enroll_student_in_lab",
+    "find_vm_for_student",
     "start_vm_by_id",
     "stop_vm_by_id",
     "delete_lab_resources",
     "debug_snapshot",
+    "list_snapshots_in_rg"
 ]

@@ -6,7 +6,7 @@ export type MeResponse = {
   email: string;
   first_name?: string | null;
   last_name?: string | null;
-  role?: "asgard" | "teacher" | "student" | "unknown";
+  role?: "asgard" | "segel" | "student" | "unknown";
   course_scope?: string[];     // e.g., ["tichnut-a","tichnut-b"] or ["devops"]
   course_family?: string | null; // e.g., "tichnut" | "devops" | "cyber"
   groups?: Array<{ id: string; name?: string }>;
@@ -50,7 +50,7 @@ export function useAccess() {
 
   const role = me?.role ?? "unknown";
   const isAsgard = role === "asgard";
-  const isTeacher = role === "teacher";
+  const isSegel = role === "segel";
   const isStudent = role === "student";
   const courseScope = me?.course_scope ?? [];
   const courseFamily = me?.course_family ?? null;
@@ -60,7 +60,7 @@ export function useAccess() {
     me,
     role,
     isAsgard,
-    isTeacher,
+    isSegel,
     isStudent,
     courseScope,
     courseFamily,

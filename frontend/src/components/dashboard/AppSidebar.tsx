@@ -1,4 +1,3 @@
-// src/components/dashboard/AppSidebar.tsx
 import { useEffect, useMemo, useState } from "react";
 import {
   Home,
@@ -42,11 +41,19 @@ type Me = {
   last_name?: string | null;
 };
 
-const navItems = [
-  { title: "Dashboard", url: "/dashboard", icon: Home },
-  { title: "Template VM", url: "/template-vm", icon: Monitor },
-  { title: "Running Labs", url: "/labs", icon: Server },
-];
+// Title-case helper (handles hyphenated words): "test-intune" -> "Test-Intune"
+function toTitle(input?: string | null) {
+  if (!input) return "";
+  return input
+    .split(" ")
+    .map((w) =>
+      w
+        .split("-")
+        .map((p) => (p ? p[0].toUpperCase() + p.slice(1).toLowerCase() : p))
+        .join("-")
+    )
+    .join(" ");
+}
 
 export function AppSidebar() {
   const { state } = useSidebar();
@@ -56,10 +63,12 @@ export function AppSidebar() {
 
   const [user, setUser] = useState<Me | null>(null);
 
-  // AAD tags saved by Auth flow
-  const [role, setRole] = useState<string | null>(null);
-  const [course, setCourse] = useState<string | null>(null);
-  const [section, setSection] = useState<string | null>(null);
+  // Read role immediately to avoid UI flicker, then keep it in state.
+  const [role, setRole] = useState<string>(
+    (localStorage.getItem("aad_role") || "").toLowerCase()
+  );
+  const [course, setCourse] = useState<string | null>(localStorage.getItem("aad_course"));
+  const [section, setSection] = useState<string | null>(localStorage.getItem("aad_section"));
 
   const api = useMemo(() => {
     const i = axios.create({
@@ -91,6 +100,7 @@ export function AppSidebar() {
     };
   }, [api, navigate]);
 
+  // Sync once on mount from localStorage
   useEffect(() => {
     const r = (localStorage.getItem("aad_role") || "").toLowerCase();
     setRole(r);
@@ -111,13 +121,34 @@ export function AppSidebar() {
     navigate("/auth", { replace: true });
   };
 
-  const displayName =
+  // Build display name (capitalized) like the greeting:
+  const rawName =
     [user?.first_name, user?.last_name].filter(Boolean).join(" ") ||
-    user?.email ||
-    "User";
+    (user?.email ? user.email.split("@")[0] : "User");
+  const displayName = toTitle(rawName);
 
-  const roleLabel = role ? role.charAt(0).toUpperCase() + role.slice(1) : null;
+  const roleLabel = role ? toTitle(role) : null;
   const isAsgard = (role || "").toLowerCase() === "asgard";
+  const isStudent = (role || "").toLowerCase() === "student";
+
+  // Title-case the course for display
+  const courseLabel = toTitle(course || "");
+
+  // Build nav items based on role
+  const navItems = useMemo(() => {
+    const labsTitle = isStudent ? "My Labs" : "Running Labs";
+    const labsItem = { title: labsTitle, url: "/labs", icon: Server };
+
+    if (isStudent) {
+      return [labsItem];
+    }
+
+    return [
+      { title: "Dashboard", url: "/dashboard", icon: Home },
+      { title: "Template VM", url: "/template-vm", icon: Monitor },
+      labsItem,
+    ];
+  }, [isStudent]);
 
   return (
     <Sidebar collapsible="icon">
@@ -175,12 +206,21 @@ export function AppSidebar() {
                     </span>
                   </div>
                 )}
-                {!isAsgard && (course || section) && (
+                {!isAsgard && (courseLabel || section) && (
                   <div className="flex items-center gap-1.5">
                     <GraduationCap className="h-3.5 w-3.5 shrink-0" />
                     <span className="truncate">
-                      {course ? <>Course: <strong>{course}</strong></> : null}
-                      {section ? <> • Section: <strong>{section}</strong></> : null}
+                      {courseLabel ? (
+                        <>
+                          Course: <strong>{courseLabel}</strong>
+                        </>
+                      ) : null}
+                      {section ? (
+                        <>
+                          {" "}
+                          • Section: <strong>{section}</strong>
+                        </>
+                      ) : null}
                     </span>
                   </div>
                 )}
