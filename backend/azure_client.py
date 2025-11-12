@@ -9,7 +9,8 @@ from azure.identity import (
 )
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
-from azure.mgmt.compute.models import VirtualMachineUpdate
+from azure.mgmt.compute.models import VirtualMachineUpdate, SnapshotUpdate
+
 
 # ---------------- Config / Tag keys & RG scope ----------------
 TARGET_RESOURCE_GROUP = "Projects-TerraLabs-RG"  # scope for destructive ops
@@ -487,9 +488,15 @@ def delete_lab_resources(*, lab_id: str, course: Optional[str] = None, dry_run: 
     return summary
 
 def list_snapshots_in_rg(resource_group: str) -> list[dict]:
+    """
+    Return snapshots in the given resource group as a list of dicts:
+      [{ "name": ..., "id": ..., "time_created": ..., "tags": {...} }, ...]
+    Sorted newest first.
+    """
     _ensure_clients()
     compute = _compute()
     items = []
+
     try:
         for snap in compute.snapshots.list_by_resource_group(resource_group):
             items.append({
@@ -499,11 +506,30 @@ def list_snapshots_in_rg(resource_group: str) -> list[dict]:
                     if getattr(snap, "time_created", None) else None,
                 "sku": getattr(getattr(snap, "sku", None), "name", None),
                 "provisioning_state": getattr(snap, "provisioning_state", None),
+                "tags": getattr(snap, "tags", {}) or {},
             })
     except Exception as e:
         print(f"[list_snapshots_in_rg] Error: {e}")
+
     items.sort(key=lambda x: x["time_created"] or "", reverse=True)
     return items
+
+# add this new function somewhere near the other snapshot helpers
+def set_snapshot_tags(resource_group: str, snapshot_name: str, tags: dict) -> dict:
+    """
+    Merge the given tags onto an existing managed snapshot.
+    """
+    _ensure_clients()
+    compute = _compute()
+    # read current tags then merge
+    snap = compute.snapshots.get(resource_group, snapshot_name)
+    new_tags = dict(getattr(snap, "tags", {}) or {})
+    new_tags.update(tags or {})
+
+    update = SnapshotUpdate(tags=new_tags)
+    poller = compute.snapshots.begin_update(resource_group, snapshot_name, update)
+    poller.result()
+    return {"name": snapshot_name, "tags": new_tags}
 
 def debug_snapshot(max_vms: int = 20):
     _ensure_clients()

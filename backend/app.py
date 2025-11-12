@@ -397,18 +397,41 @@ def api_list_snapshots():
 
         q = (request.args.get("q") or "").strip().lower()
 
+        # course can come explicitly (query) or implicitly from the token
+        course_param = (request.args.get("course") or "").strip()
+        try:
+            claims = _current_claims()
+        except Exception:
+            claims = {}
+        course_claim = (claims.get("course") or "").strip()
+        course = (course_param or course_claim).lower()
+
+        def tag_val(tags: dict, *keys) -> str:
+            for k in keys:
+                for tk, tv in (tags or {}).items():
+                    if (tk or "").lower() == k.lower():
+                        return (tv or "")
+            return ""
+
         snaps = list(compute.snapshots.list_by_resource_group(snapshot_rg))
         items = []
         for s in snaps:
             name = getattr(s, "name", "")
             if q and q not in name.lower():
                 continue
+
+            tags = getattr(s, "tags", {}) or {}
+            snap_course = (tag_val(tags, "LabCourse", "course", "TLABS_COURSE") or "").lower()
+            if course and snap_course != course:
+                continue
+
             items.append({
                 "name": name,
                 "id": getattr(s, "id", None),
                 "time_created": getattr(s, "time_created", None).isoformat() if getattr(s, "time_created", None) else None,
                 "sku": getattr(getattr(s, "sku", None), "name", None),
                 "provisioning_state": getattr(s, "provisioning_state", None),
+                "tags": tags,
             })
 
         items.sort(key=lambda x: x["time_created"] or "", reverse=True)
@@ -717,6 +740,18 @@ def api_template_vm_snapshot():
             snapshot_name = _format_snapshot_name_from_base(raw)
 
         res = snapshot_and_delete_template_vm(user_id=u.email, snapshot_name=snapshot_name)
+
+        # --------  tag snapshot with course so it can be filtered later -------
+        try:
+            claims = _current_claims()
+            course = (claims.get("course") or "").strip()
+            snapshot_rg = os.environ.get("TL_SNAPSHOT_RG")
+            if course and snapshot_rg:
+                from azure_client import set_snapshot_tags  # lazy import to avoid cycles
+                set_snapshot_tags(snapshot_rg, snapshot_name, {"LabCourse": course})
+        except Exception as e:
+            print("[/api/template-vm/snapshot] tagging failed:", e)
+
         return jsonify(res), 200
     except Exception as e:
         print("[/api/template-vm/snapshot] Error:", e)

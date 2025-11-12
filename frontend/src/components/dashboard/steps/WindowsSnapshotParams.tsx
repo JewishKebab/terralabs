@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect, useRef } from "react";
+import { useMemo, useState, useEffect } from "react";
 import axios, { AxiosHeaders } from "axios";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -128,11 +128,15 @@ export default function WindowsSnapshotParams({
   const updateDisk = (idx: number, patch: Partial<Disk>) =>
     setDisks((d) => d.map((x, i) => (i === idx ? { ...x, ...patch } : x)));
 
-  // --- Snapshot fetcher ---
+  // --- Snapshot fetcher (filtered by course) ---
   const fetchSnapshots = async (q: string) => {
     setSnapLoading(true);
     try {
-      const res = await api.get("/api/snapshots", { params: q ? { q } : {} });
+      const params: Record<string, string> = { course };
+      if (q) params.q = q;
+
+      // FIX: use the snapshots API and pass course so backend filters
+      const res = await api.get("/api/snapshots", { params });
       const items: SnapshotItem[] = (res.data?.snapshots ?? []).map((s: any) => ({
         name: s.name,
         id: s.id,
@@ -156,13 +160,13 @@ export default function WindowsSnapshotParams({
   useEffect(() => {
     fetchSnapshots("");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [course]); // re-run if course changes
 
   // re-fetch when query changes
   useEffect(() => {
     fetchSnapshots(debouncedQuery);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedQuery]);
+  }, [debouncedQuery, course]);
 
   const handleSubmit = async () => {
     if (!selectedSnapshot?.id || !vmSize || vmCount <= 0) {
@@ -317,8 +321,8 @@ export default function WindowsSnapshotParams({
                   return (
                     <li
                       key={s.id}
-                      className={`px-3 py-2 cursor-pointer flex items-center justify-between hover:bg-accent ${
-                        selected ? "bg-accent" : ""
+                      className={`px-3 py-2 cursor-pointer flex items-center justify-between hover:bg-accent/50 ${
+                        selected ? "bg-primary/10" : ""
                       }`}
                       onClick={() => setSelectedSnapshot(s)}
                     >
@@ -331,7 +335,7 @@ export default function WindowsSnapshotParams({
                         </div>
                       </div>
                       {selected ? (
-                        <Badge className="ml-3 inline-flex items-center gap-1">
+                        <Badge variant="secondary" className="ml-3 inline-flex items-center gap-1">
                           <CheckCircle2 className="h-3 w-3" /> Selected
                         </Badge>
                       ) : null}
