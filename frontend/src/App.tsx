@@ -13,7 +13,13 @@ import PendingApproval from "./pages/PendingApproval";
 import TemplateVmPage from "./pages/TemplateVm";
 
 import { MsalProvider } from "@azure/msal-react";
-import { PublicClientApplication, Configuration, LogLevel } from "@azure/msal-browser";
+import {
+  PublicClientApplication,
+  Configuration,
+  LogLevel,
+  EventType,
+  AuthenticationResult,
+} from "@azure/msal-browser";
 
 const queryClient = new QueryClient();
 
@@ -31,13 +37,13 @@ if (!AZURE_CLIENT_ID || !AZURE_TENANT_ID) {
 
 const msalConfig: Configuration = {
   auth: {
-    // Do NOT send a placeholder. If undefined, MSAL will throw immediately instead of redirecting with a fake id.
     clientId: AZURE_CLIENT_ID ?? "",
     authority: AZURE_TENANT_ID
       ? `https://login.microsoftonline.com/${AZURE_TENANT_ID}`
       : "https://login.microsoftonline.com/common",
-    redirectUri: window.location.origin,
-    postLogoutRedirectUri: window.location.origin,
+    // Align redirects with your /auth route so post-login exchange logic runs there.
+    redirectUri: `${window.location.origin}/auth`,
+    postLogoutRedirectUri: `${window.location.origin}/auth`,
   },
   cache: {
     cacheLocation: "localStorage",
@@ -56,9 +62,32 @@ const msalConfig: Configuration = {
 
 let pca: PublicClientApplication | null = null;
 try {
-  // Only construct if we have a client id; otherwise we’ll render without MSAL and the AAD button can be disabled.
   if (AZURE_CLIENT_ID) {
     pca = new PublicClientApplication(msalConfig);
+
+    // Ensure active account is always the one that just logged in,
+    // and cleared after logout.
+    pca.addEventCallback((event) => {
+      if (event.eventType === EventType.LOGIN_SUCCESS) {
+        const result = event.payload as AuthenticationResult;
+        if (result?.account) {
+          pca!.setActiveAccount(result.account);
+        }
+      }
+      if (event.eventType === EventType.LOGOUT_SUCCESS) {
+        pca!.setActiveAccount(null);
+      }
+    });
+
+    // Startup convenience: if there is exactly one cached account and no active one, set it.
+    // This avoids grabbing a stale accounts[0] elsewhere.
+    const active = pca.getActiveAccount?.();
+    if (!active) {
+      const all = pca.getAllAccounts?.() ?? [];
+      if (all.length === 1) {
+        pca.setActiveAccount(all[0]);
+      }
+    }
   }
 } catch (e) {
   console.error("[MSAL] Failed to initialize:", e);
